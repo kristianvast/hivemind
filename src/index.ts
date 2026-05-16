@@ -1,44 +1,16 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { isFullPage } from "@notionhq/client";
 import { WebhookVerificationError, Worker } from "@notionhq/workers";
-import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
+
+import { handleBriefApproved, runChainForBrief } from "./chain";
+import { getBriefContext } from "./notion";
 
 const worker = new Worker();
 export default worker;
 
-const briefsDb = worker.database("briefs", {
-	type: "managed",
-	initialTitle: "Briefs",
-	primaryKeyProperty: "Name",
-	schema: {
-		properties: {
-			Name: Schema.title(),
-			Status: Schema.select([
-				{ name: "Backlog", color: "default" },
-				{ name: "Triaged", color: "yellow" },
-				{ name: "In Progress", color: "blue" },
-				{ name: "Needs Review", color: "purple" },
-				{ name: "Done", color: "green" },
-				{ name: "Failed", color: "red" },
-				{ name: "Archived", color: "gray" },
-			]),
-			Owner: Schema.select([
-				{ name: "Triage", color: "gray" },
-				{ name: "Scout", color: "blue" },
-				{ name: "Forge", color: "orange" },
-				{ name: "Scribe", color: "green" },
-				{ name: "Sentinel", color: "purple" },
-			]),
-		},
-	},
-});
-
-worker.sync("briefsSeed", {
-	database: briefsDb,
-	mode: "incremental",
-	schedule: "manual",
-	execute: async () => ({ changes: [], hasMore: false }),
-});
+const CHAIN_TRIGGER_STATUS = "Triaged";
+const APPROVED_STATUS = "Done";
 
 worker.tool("notionWhoAmI", {
 	title: "Notion Who Am I",
@@ -114,10 +86,24 @@ function extractPageId(body: Record<string, unknown>): string | undefined {
 	return undefined;
 }
 
+const PROCESSED_DELIVERY_IDS = new Set<string>();
+const DEDUP_CACHE_MAX = 500;
+
+function rememberDelivery(deliveryId: string): void {
+	PROCESSED_DELIVERY_IDS.add(deliveryId);
+	if (PROCESSED_DELIVERY_IDS.size > DEDUP_CACHE_MAX) {
+		const keep = Array.from(PROCESSED_DELIVERY_IDS).slice(
+			-Math.floor(DEDUP_CACHE_MAX / 2),
+		);
+		PROCESSED_DELIVERY_IDS.clear();
+		for (const id of keep) PROCESSED_DELIVERY_IDS.add(id);
+	}
+}
+
 worker.webhook("onBriefStatusChange", {
 	title: "On Brief Status Change",
 	description:
-		"Hit by a Notion DB automation when a brief's Status changes. Verifies X-Hivemind-Secret, posts a 'Hivemind received' comment back to confirm the loop.",
+		"Hit by a Notion DB automation when a brief's Status changes. Verifies X-Hivemind-Secret, dedups by deliveryId, skips trashed pages and bot-authored edits (loop prevention). When status flips to 'Triaged', runs Scout then Forge and appends their outputs to the brief page; on chain failure the brief is set to 'Failed' with the trace appended.",
 	execute: async (events, { notion }) => {
 		for (const event of events) {
 			const expectedSecret = process.env.HIVEMIND_WEBHOOK_SECRET;
@@ -135,14 +121,16 @@ worker.webhook("onBriefStatusChange", {
 				);
 			}
 
-			const body = (event.body ?? {}) as Record<string, unknown>;
-			console.log(
-				"[onBriefStatusChange] delivery",
-				event.deliveryId,
-				"body keys:",
-				Object.keys(body),
-			);
+			if (PROCESSED_DELIVERY_IDS.has(event.deliveryId)) {
+				console.log(
+					"[onBriefStatusChange] skip duplicate delivery",
+					event.deliveryId,
+				);
+				continue;
+			}
+			rememberDelivery(event.deliveryId);
 
+			const body = (event.body ?? {}) as Record<string, unknown>;
 			const pageId = extractPageId(body);
 			if (!pageId) {
 				console.warn(
@@ -151,20 +139,75 @@ worker.webhook("onBriefStatusChange", {
 				);
 				continue;
 			}
+			console.log(
+				"[onBriefStatusChange] delivery",
+				event.deliveryId,
+				"page",
+				pageId,
+			);
 
-			await notion.comments.create({
-				parent: { page_id: pageId },
-				rich_text: [
-					{
-						type: "text",
-						text: {
-							content: "🐝 Hivemind received this brief.",
-						},
-					},
-				],
-			});
+			let page: Awaited<ReturnType<typeof notion.pages.retrieve>>;
+			try {
+				page = await notion.pages.retrieve({ page_id: pageId });
+			} catch (err: unknown) {
+				const code =
+					err && typeof err === "object" && "code" in err
+						? (err as { code?: string }).code
+						: undefined;
+				if (code === "object_not_found" || code === "validation_error") {
+					console.log(
+						"[onBriefStatusChange] page inaccessible (probably trashed):",
+						pageId,
+						code,
+					);
+					continue;
+				}
+				throw err;
+			}
 
-			console.log("[onBriefStatusChange] commented on page", pageId);
+			if (!isFullPage(page)) {
+				console.warn(
+					"[onBriefStatusChange] partial page response, skipping:",
+					pageId,
+				);
+				continue;
+			}
+
+			if (page.in_trash) {
+				console.log("[onBriefStatusChange] trashed, skipping:", pageId);
+				continue;
+			}
+
+			const botUserId = process.env.HIVEMIND_BOT_USER_ID;
+			const brief = await getBriefContext(notion, page);
+			console.log(
+				"[onBriefStatusChange] page",
+				pageId,
+				"status=",
+				brief.status,
+				"title=",
+				brief.title.slice(0, 80),
+			);
+
+			if (brief.status === APPROVED_STATUS) {
+				await handleBriefApproved(notion, pageId);
+				console.log("[onBriefStatusChange] approved", pageId);
+				continue;
+			}
+
+			if (brief.status !== CHAIN_TRIGGER_STATUS) {
+				console.log(
+					"[onBriefStatusChange] status is not",
+					CHAIN_TRIGGER_STATUS,
+					"or",
+					APPROVED_STATUS,
+					"— no chain to run",
+				);
+				continue;
+			}
+
+			await runChainForBrief({ notion, brief, botUserId });
+			console.log("[onBriefStatusChange] chain complete for", pageId);
 		}
 	},
 });

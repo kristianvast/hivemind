@@ -1,0 +1,10 @@
+{
+	"$schema": "https://opencode.ai/config.json",
+	"mcp": {
+		"notion-docs": {
+			"type": "remote",
+			"url": "https://developers.notion.com/mcp",
+			"enabled": true
+		}
+	}
+}

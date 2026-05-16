@@ -20,6 +20,7 @@
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "^0.39.0",
-		"@notionhq/workers": ">=0.0.0"
+		"@notionhq/workers": ">=0.0.0",
+		"openai": "^6.38.0"
 	}
 }

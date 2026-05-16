@@ -5,6 +5,25 @@
 - `.examples/` has focused samples (sync, tool, automation, OAuth, webhook).
 - Shared agent skills live in `.agents/skills/`. `.claude/skills` is kept as a compatibility symlink for Claude-specific discovery.
 - Generated: `dist/` build output, `workers.json` CLI config.
+- `opencode.json` wires up project-level MCP servers and other opencode settings.
+
+## Documentation Lookup (Notion Docs MCP)
+
+The `notion-docs` MCP server is wired up in `opencode.json` and points at `https://developers.notion.com/mcp` (no auth required). Use it whenever you need authoritative answers about the **public Notion API** that backs `context.notion` / `@notionhq/client` — endpoints, request/response shapes, property types, OAuth scopes, rate limits, webhook delivery, etc.
+
+Two tools are exposed:
+
+- `notion-docs_search_notion_docs` — semantic search over the docs. Best first step for conceptual or fuzzy questions ("how do I paginate query results?", "what scopes does the public OAuth flow need?"). Returns titles and page paths.
+- `notion-docs_query_docs_filesystem_notion_docs` — read-only shell against an in-memory virtual filesystem containing all docs pages (`.mdx`) and the OpenAPI spec. Supports `rg`, `grep`, `find`, `tree`, `ls`, `cat`, `head`, `tail`, `stat`, `wc`, `sort`, `uniq`, `cut`, `sed`, `awk`, `jq`. Each call is stateless — pass absolute paths or chain with `&&`. Output is truncated to 30KB per call.
+
+**Typical flow:**
+
+1. Broad question → `search_notion_docs` to find the right page path.
+2. Read the page → `query_docs_filesystem` with `head -200 /api-reference/post-database-query.mdx` (or `cat` for short pages).
+3. Need exact keyword matches across the docs → `rg -il "rate limit" /` then `rg -C 3 "pattern" /path/file.mdx`.
+4. Inspect the API surface → `cat /openapi/spec.json | jq '.paths | keys'`.
+
+**Scope reminder:** this MCP covers the **public Notion API**. For Workers-specific concerns — `Worker`, `Schema`, `Builder`, sync runtime, `ntn` CLI, capability shapes — this file and `.examples/` remain the source of truth.
 
 ## Worker & Capability API (SDK)
 - `@notionhq/workers` provides `Worker`, schema helpers, and builders; the `ntn` CLI powers worker management.
