@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+dist/
+node_modules/
+workers.*.json
+workers.json
+
+# Opencode session state
+.sisyphus/
