@@ -1,16 +1,30 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { isFullPage } from "@notionhq/client";
+import type { PageObjectResponse } from "@notionhq/client";
 import { WebhookVerificationError, Worker } from "@notionhq/workers";
 import { j } from "@notionhq/workers/schema-builder";
+import Pusher from "pusher";
 
 import { handleBriefApproved, runChainForBrief } from "./chain";
+import { ALL_CATEGORIES, classifyBrief, type Category } from "./classify";
 import { getBriefContext } from "./notion";
+import { provisionProject } from "./provision";
+import { mergeHivemindState, readHivemindState } from "./state";
 
 const worker = new Worker();
 export default worker;
 
 const CHAIN_TRIGGER_STATUS = "Triaged";
 const APPROVED_STATUS = "Done";
+const FORGE_LOCAL_OWNER = "Forge-Local";
+const FORGE_LOCAL_TRIGGER_STATUSES = new Set(["Triaged", "Provisioned"]);
+
+let pusherClient: Pusher | null = null;
+let pusherWarningLogged = false;
+
+const CHAIN_LOCK_TTL_MS = 15 * 60 * 1000;
+const LOCK_VERIFY_DELAY_MS = 750;
+const CHAIN_COALESCE_MS = 10_000;
 
 worker.tool("notionWhoAmI", {
 	title: "Notion Who Am I",
@@ -69,6 +83,197 @@ worker.tool("pingClaude", {
 	},
 });
 
+worker.tool("classifyBrief", {
+	title: "Classify Brief",
+	description: "Admin/QA: classify a brief title+body into a Category via Haiku.",
+	schema: j.object({
+		title: j.string(),
+		body: j.string().nullable(),
+	}),
+	execute: async (input) => {
+		const category = await classifyBrief({
+			title: input.title,
+			body: input.body ?? undefined,
+		});
+		return { category };
+	},
+});
+
+worker.tool("provisionProject", {
+	title: "Provision Project Subtree",
+	description:
+		"Admin/QA: provision the Notion project subtree for a brief (idempotent). Layout depends on category — writing/quick get an inline answer page (no Drafts DB); others get the full Plan/Drafts/Activity layout. If category is omitted, it's read from the brief's Category property (defaults to 'deep').",
+	schema: j.object({
+		briefId: j.string(),
+		category: j.string().nullable(),
+	}),
+	execute: async ({ briefId, category }, { notion }) => {
+		const page = await notion.pages.retrieve({ page_id: briefId });
+		if (!isFullPage(page)) {
+			throw new Error(`Brief ${briefId} returned partial response`);
+		}
+		const title = extractTitle(page);
+		const resolved = resolveCategoryArg(category) ?? extractCategory(page) ?? "deep";
+		const ids = await provisionProject(notion, briefId, title, resolved);
+		return JSON.parse(JSON.stringify(ids));
+	},
+});
+
+worker.tool("debugState", {
+	title: "Debug Hivemind State",
+	description: "Admin/QA: read and pretty-print the Hivemind State JSON for a brief.",
+	schema: j.object({
+		briefId: j.string(),
+	}),
+	execute: async ({ briefId }, { notion }) => {
+		const state = await readHivemindState(notion, briefId);
+		return JSON.parse(JSON.stringify(state));
+	},
+});
+
+function extractTitle(page: PageObjectResponse): string {
+	for (const value of Object.values(page.properties)) {
+		if (value.type === "title") {
+			return value.title.map((rt) => rt.plain_text).join("");
+		}
+	}
+	return "";
+}
+
+function extractOwner(page: PageObjectResponse): string | null {
+	const owner = page.properties.Owner;
+	if (owner?.type !== "select") return null;
+	return owner.select?.name ?? null;
+}
+
+function extractCategory(page: PageObjectResponse): Category | null {
+	const cat = page.properties.Category;
+	if (cat?.type !== "select") return null;
+	const name = cat.select?.name;
+	if (!name) return null;
+	return ALL_CATEGORIES.includes(name as Category) ? (name as Category) : null;
+}
+
+function resolveCategoryArg(arg: string | null | undefined): Category | null {
+	if (!arg) return null;
+	return ALL_CATEGORIES.includes(arg as Category) ? (arg as Category) : null;
+}
+
+async function pusherPublish(briefId: string): Promise<void> {
+	const appId = process.env.PUSHER_APP_ID;
+	const key = process.env.PUSHER_KEY;
+	const secret = process.env.PUSHER_SECRET;
+	const cluster = process.env.PUSHER_CLUSTER;
+	if (!appId || !key || !secret || !cluster) {
+		if (!pusherWarningLogged) {
+			console.warn(
+				"[pusherPublish] PUSHER_APP_ID/PUSHER_KEY/PUSHER_SECRET/PUSHER_CLUSTER not fully configured; skipping Anvil dispatch publish.",
+			);
+			pusherWarningLogged = true;
+		}
+		return;
+	}
+
+	try {
+		if (!pusherClient) {
+			pusherClient = new Pusher({
+				appId,
+				key,
+				secret,
+				cluster,
+				useTLS: true,
+			});
+		}
+		await pusherClient.trigger(
+			process.env.PUSHER_CHANNEL ?? "anvil-dispatch",
+			"brief.dispatched",
+			{ briefId },
+		);
+	} catch (err) {
+		console.warn("[pusherPublish] failed to publish Anvil dispatch:", err);
+	}
+}
+
+async function acquireChainLock(args: {
+	notion: import("@notionhq/client").Client;
+	pageId: string;
+	deliveryId: string;
+}): Promise<boolean> {
+	const { notion, pageId, deliveryId } = args;
+	const now = Date.now();
+
+	const fresh = await readHivemindState(notion, pageId);
+	if (fresh.chainRunning) {
+		const startedAt = Date.parse(fresh.chainRunning.startedAt);
+		if (Number.isFinite(startedAt) && now - startedAt < CHAIN_LOCK_TTL_MS) {
+			console.log(
+				"[lock] chain already running for",
+				pageId,
+				"since",
+				fresh.chainRunning.startedAt,
+				"owner-delivery=",
+				fresh.chainRunning.deliveryId,
+				"— skip",
+				deliveryId,
+			);
+			return false;
+		}
+		console.log(
+			"[lock] stale lock for",
+			pageId,
+			"from",
+			fresh.chainRunning.startedAt,
+			"— overriding with",
+			deliveryId,
+		);
+	}
+
+	if (fresh.lastChainStartedAt) {
+		const lastStartedAt = Date.parse(fresh.lastChainStartedAt);
+		if (
+			Number.isFinite(lastStartedAt) &&
+			now - lastStartedAt < CHAIN_COALESCE_MS
+		) {
+			console.log(
+				"[lock] coalesced — chain started",
+				now - lastStartedAt,
+				"ms ago for",
+				pageId,
+				"— skip",
+				deliveryId,
+			);
+			return false;
+		}
+	}
+
+	const startedAtIso = new Date(now).toISOString();
+	await mergeHivemindState(notion, pageId, {
+		chainRunning: {
+			startedAt: startedAtIso,
+			deliveryId,
+		},
+		lastChainStartedAt: startedAtIso,
+	});
+
+	await new Promise((resolve) => setTimeout(resolve, LOCK_VERIFY_DELAY_MS));
+
+	const afterWait = await readHivemindState(notion, pageId);
+	if (afterWait.chainRunning?.deliveryId !== deliveryId) {
+		console.log(
+			"[lock] lost race for",
+			pageId,
+			"winner=",
+			afterWait.chainRunning?.deliveryId,
+			"— abort",
+			deliveryId,
+		);
+		return false;
+	}
+
+	console.log("[lock] acquired", pageId, "delivery=", deliveryId);
+	return true;
+}
+
 function extractPageId(body: Record<string, unknown>): string | undefined {
 	const data = (body as { data?: Record<string, unknown> }).data;
 	for (const candidate of [
@@ -86,26 +291,13 @@ function extractPageId(body: Record<string, unknown>): string | undefined {
 	return undefined;
 }
 
-const PROCESSED_DELIVERY_IDS = new Set<string>();
-const DEDUP_CACHE_MAX = 500;
-
-function rememberDelivery(deliveryId: string): void {
-	PROCESSED_DELIVERY_IDS.add(deliveryId);
-	if (PROCESSED_DELIVERY_IDS.size > DEDUP_CACHE_MAX) {
-		const keep = Array.from(PROCESSED_DELIVERY_IDS).slice(
-			-Math.floor(DEDUP_CACHE_MAX / 2),
-		);
-		PROCESSED_DELIVERY_IDS.clear();
-		for (const id of keep) PROCESSED_DELIVERY_IDS.add(id);
-	}
-}
-
 worker.webhook("onBriefStatusChange", {
 	title: "On Brief Status Change",
 	description:
-		"Hit by a Notion DB automation when a brief's Status changes. Verifies X-Hivemind-Secret, dedups by deliveryId, skips trashed pages and bot-authored edits (loop prevention). When status flips to 'Triaged', runs Scout then Forge and appends their outputs to the brief page; on chain failure the brief is set to 'Failed' with the trace appended.",
+		"Hit by a Notion DB automation when a brief's Status changes. Verifies X-Hivemind-Secret, dedups by deliveryId via Hivemind State, skips trashed pages and bot-authored edits (loop prevention). When status flips to 'Triaged', runs Scout then Forge and appends their outputs to the brief page; on chain failure the brief is set to 'Failed' with the trace appended.",
 	execute: async (events, { notion }) => {
 		for (const event of events) {
+			// 1. Verify secret
 			const expectedSecret = process.env.HIVEMIND_WEBHOOK_SECRET;
 			const providedSecret =
 				event.headers["x-hivemind-secret"] ??
@@ -121,15 +313,7 @@ worker.webhook("onBriefStatusChange", {
 				);
 			}
 
-			if (PROCESSED_DELIVERY_IDS.has(event.deliveryId)) {
-				console.log(
-					"[onBriefStatusChange] skip duplicate delivery",
-					event.deliveryId,
-				);
-				continue;
-			}
-			rememberDelivery(event.deliveryId);
-
+			// 2. Extract pageId
 			const body = (event.body ?? {}) as Record<string, unknown>;
 			const pageId = extractPageId(body);
 			if (!pageId) {
@@ -139,6 +323,17 @@ worker.webhook("onBriefStatusChange", {
 				);
 				continue;
 			}
+
+			// 3. Dedup via state
+			const prior = await readHivemindState(notion, pageId);
+			if (prior.lastDeliveryId === event.deliveryId) {
+				console.log(
+					"[onBriefStatusChange] skip duplicate delivery",
+					event.deliveryId,
+				);
+				continue;
+			}
+
 			console.log(
 				"[onBriefStatusChange] delivery",
 				event.deliveryId,
@@ -146,6 +341,7 @@ worker.webhook("onBriefStatusChange", {
 				pageId,
 			);
 
+			// 4. Retrieve page, filter trash + partial
 			let page: Awaited<ReturnType<typeof notion.pages.retrieve>>;
 			try {
 				page = await notion.pages.retrieve({ page_id: pageId });
@@ -179,23 +375,66 @@ worker.webhook("onBriefStatusChange", {
 			}
 
 			const botUserId = process.env.HIVEMIND_BOT_USER_ID;
+			const editorId = page.last_edited_by?.id;
+			if (botUserId && editorId === botUserId) {
+				console.log(
+					"[onBriefStatusChange] bot-authored edit, skipping:",
+					pageId,
+					"editor=",
+					editorId,
+				);
+				await mergeHivemindState(notion, pageId, {
+					lastDeliveryId: event.deliveryId,
+				});
+				continue;
+			}
+
 			const brief = await getBriefContext(notion, page);
+			const owner = extractOwner(page);
 			console.log(
 				"[onBriefStatusChange] page",
 				pageId,
 				"status=",
 				brief.status,
+				"owner=",
+				owner,
 				"title=",
 				brief.title.slice(0, 80),
 			);
 
-			if (brief.status === APPROVED_STATUS) {
+			// 6. Route by status
+			if (
+				owner === FORGE_LOCAL_OWNER &&
+				brief.status !== null &&
+				FORGE_LOCAL_TRIGGER_STATUSES.has(brief.status)
+			) {
+				await pusherPublish(pageId);
+				console.log("[onBriefStatusChange] dispatched Forge-Local", pageId);
+				await mergeHivemindState(notion, pageId, { lastDeliveryId: event.deliveryId });
+			} else if (brief.status === APPROVED_STATUS) {
 				await handleBriefApproved(notion, pageId);
 				console.log("[onBriefStatusChange] approved", pageId);
-				continue;
-			}
-
-			if (brief.status !== CHAIN_TRIGGER_STATUS) {
+				await mergeHivemindState(notion, pageId, { lastDeliveryId: event.deliveryId });
+			} else if (brief.status === CHAIN_TRIGGER_STATUS) {
+				const acquired = await acquireChainLock({
+					notion,
+					pageId,
+					deliveryId: event.deliveryId,
+				});
+				if (!acquired) {
+					await mergeHivemindState(notion, pageId, { lastDeliveryId: event.deliveryId });
+					continue;
+				}
+				try {
+					await runChainForBrief({ notion, brief, botUserId });
+					console.log("[onBriefStatusChange] chain complete for", pageId);
+				} finally {
+					await mergeHivemindState(notion, pageId, {
+						lastDeliveryId: event.deliveryId,
+						chainRunning: undefined,
+					});
+				}
+			} else {
 				console.log(
 					"[onBriefStatusChange] status is not",
 					CHAIN_TRIGGER_STATUS,
@@ -203,11 +442,8 @@ worker.webhook("onBriefStatusChange", {
 					APPROVED_STATUS,
 					"— no chain to run",
 				);
-				continue;
+				await mergeHivemindState(notion, pageId, { lastDeliveryId: event.deliveryId });
 			}
-
-			await runChainForBrief({ notion, brief, botUserId });
-			console.log("[onBriefStatusChange] chain complete for", pageId);
 		}
 	},
 });
