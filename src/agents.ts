@@ -58,6 +58,7 @@ export async function invokeAgent(args: RunAgentArgs): Promise<RunAgentReturn> {
 		model: args.spec.model,
 		stepBudget: args.spec.stepBudget,
 		taskBudgetTokens: args.spec.taskBudgetTokens,
+		maxTokens: args.spec.maxTokens,
 		thinking: args.spec.thinking,
 	});
 

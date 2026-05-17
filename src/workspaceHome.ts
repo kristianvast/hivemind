@@ -253,8 +253,12 @@ export async function provisionWorkspaceHome(args: {
 		configuration: {
 			type: "chart",
 			chart_type: "column",
-			x_axis: { property_id: "Agent" },
-			y_axis: { aggregation: "sum", property_id: "Tokens" },
+			x_axis: {
+				type: "select",
+				property_id: "Agent",
+				sort: { type: "manual" },
+			},
+			y_axis: { aggregator: "sum", property_id: "Tokens" },
 		},
 	});
 

@@ -42,7 +42,8 @@ export type RunAgent =
 	| "Librarian"
 	| "Oracle"
 	| "Sentinel"
-	| "Orchestrator";
+	| "Orchestrator"
+	| "Anvil";
 
 export type RunStatus = "queued" | "running" | "done" | "failed";
 export type RunVerdict = "approve" | "needs-revision";
@@ -63,6 +64,7 @@ export const RUNS_DB_PROPERTIES: DbPropertiesRequest = {
 				{ name: "Oracle", color: "pink" },
 				{ name: "Sentinel", color: "green" },
 				{ name: "Orchestrator", color: "gray" },
+				{ name: "Anvil", color: "orange" },
 			],
 		},
 	},
@@ -258,9 +260,13 @@ export async function ensureRunsViews(args: {
 			configuration: {
 				type: "chart",
 				chart_type: "column",
-				x_axis: { property_id: propIds.agent },
+				x_axis: {
+					type: "select",
+					property_id: propIds.agent,
+					sort: { type: "manual" },
+				},
 				y_axis: {
-					aggregation: "sum",
+					aggregator: "sum",
 					property_id: propIds.tokens,
 				},
 			},
@@ -271,9 +277,13 @@ export async function ensureRunsViews(args: {
 			configuration: {
 				type: "chart",
 				chart_type: "column",
-				x_axis: { property_id: propIds.agent },
+				x_axis: {
+					type: "select",
+					property_id: propIds.agent,
+					sort: { type: "manual" },
+				},
 				y_axis: {
-					aggregation: "average",
+					aggregator: "average",
 					property_id: propIds.duration,
 				},
 			},

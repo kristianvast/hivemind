@@ -15,6 +15,7 @@ import type { AgentSpec } from "./architect";
 import { getToolNamesForAgent } from "./tools/registry";
 
 const HAIKU = "claude-haiku-4-5";
+const SUBAGENT_MAX_TOKENS = 8_192;
 
 // ---------------------------------------------------------------------------
 // Scout — workspace research sub-agent
@@ -62,6 +63,7 @@ export function getScoutSubagentSpec(): AgentSpec {
 		model: HAIKU,
 		stepBudget: SCOUT_STEP_BUDGET,
 		taskBudgetTokens: SCOUT_TASK_BUDGET,
+		maxTokens: SUBAGENT_MAX_TOKENS,
 		systemPrompt: SCOUT_SYSTEM,
 		toolNames: getToolNamesForAgent("Scout"),
 	};
@@ -120,6 +122,7 @@ export function getSentinelSpec(): AgentSpec {
 		model: HAIKU,
 		stepBudget: SENTINEL_STEP_BUDGET,
 		taskBudgetTokens: SENTINEL_TASK_BUDGET,
+		maxTokens: SUBAGENT_MAX_TOKENS,
 		systemPrompt: SENTINEL_SYSTEM,
 		toolNames: getToolNamesForAgent("Sentinel"),
 	};
@@ -169,6 +172,7 @@ export function getLibrarianSpec(): AgentSpec {
 		model: HAIKU,
 		stepBudget: LIBRARIAN_STEP_BUDGET,
 		taskBudgetTokens: LIBRARIAN_TASK_BUDGET,
+		maxTokens: SUBAGENT_MAX_TOKENS,
 		systemPrompt: LIBRARIAN_SYSTEM,
 		toolNames: getToolNamesForAgent("Librarian"),
 	};
@@ -225,7 +229,87 @@ export function getOracleSpec(): AgentSpec {
 		thinking: { type: "enabled", budget_tokens: ORACLE_THINKING_BUDGET },
 		stepBudget: ORACLE_STEP_BUDGET,
 		taskBudgetTokens: ORACLE_TASK_BUDGET,
+		maxTokens: SUBAGENT_MAX_TOKENS,
 		systemPrompt: ORACLE_SYSTEM,
 		toolNames: getToolNamesForAgent("Oracle"),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Anvil — local-execution sub-agent (filesystem + localhost + Playwright)
+// ---------------------------------------------------------------------------
+//
+// Anvil is the only Hivemind agent that touches the local filesystem,
+// spins up an HTTP server, and drives a real headless browser. Runs only
+// in `--local` orchestrator mode. The Architect calls `delegateAnvil`
+// when the brief is about BUILDING and DEMONSTRATING something visual.
+//
+// Anvil's tools are concrete and few:
+//   - anvilWriteFile(path, content)   → write HTML/CSS/JS
+//   - anvilServe()                    → start localhost server
+//   - anvilScreenshot(url)            → headless Chromium → file_upload_id
+//   - anvilEmbedImage(page_id, fid)   → image block on a subtree page
+//   - anvilSay(page_id, text)         → callout block
+//   - appendBlocks / createChildPage  → free-form Notion writes
+//   - done({summary})                 → return to Architect
+
+const ANVIL_SYSTEM = `You are Anvil, the local-execution sub-agent. The Architect spawned you to BUILD and DEMONSTRATE something — write real files on the host machine, serve them over localhost, capture a screenshot in a headless browser, and embed proof in the brief's Notion subtree.
+
+# YOUR TOOLS (and ONLY these)
+- \`getBriefMetadata\`, \`getProjectIds\` — context. ALWAYS call \`getProjectIds\` first — you need the \`project_root_id\` to write proof.
+- \`anvilWriteFile({ path, content })\` — write a text file into your session's temp directory. \`path\` is RELATIVE (no leading /, no ..).
+- \`anvilServe()\` — start a static HTTP server on 127.0.0.1 serving your files. Returns \`{ url, port }\`. Idempotent — safe to call twice. The server STAYS ALIVE after you finish so the human can visit the URL.
+- \`anvilScreenshot({ url })\` — headless Chromium → uploads PNG to Notion → returns \`{ file_upload_id, width, height }\`.
+- \`anvilEmbedImage({ page_id, file_upload_id, caption })\` — drops the image into a page in the subtree.
+- \`anvilSay({ page_id, text, emoji?, color? })\` — drops a callout block to surface the live URL.
+- \`appendBlocks({ page_id, blocks })\` — free-form Notion blocks (heading, paragraph, code, bullet, etc.).
+- \`createChildPage({ parent_id, title, blocks })\` — create a child page in the subtree.
+- \`readPage({ page_id })\` — read a page if you need to check existing content.
+- \`addComment\`, \`done\` — finish.
+
+# YOUR JOB — STRICT 8-STEP WORKFLOW
+1. \`getBriefMetadata\` + \`getProjectIds\` (parallel). Record the \`project_root_id\` for steps 6-7.
+2. Plan the deliverable. Decide files (usually one \`index.html\` is enough; add \`styles.css\` / \`app.js\` only if the brief warrants).
+3. \`anvilWriteFile\` for each file. Write REAL, working HTML with inline content from the brief — no \`Lorem ipsum\` unless explicitly asked.
+4. \`anvilServe()\` → grab the \`url\`.
+5. \`anvilScreenshot({ url })\` → grab the \`file_upload_id\`.
+6. \`anvilEmbedImage({ page_id: project_root_id, file_upload_id, caption: "Live preview" })\`.
+7. \`anvilSay({ page_id: project_root_id, text: "🌐 Live demo: <url>", emoji: "🌐", color: "blue_background" })\`. The URL is the proof the human will click.
+8. \`done({ summary })\` — 1-2 sentences: what you built + the URL.
+
+# STYLE & QUALITY BAR
+- The screenshot is the deliverable. Build something that LOOKS GOOD at first glance — a real hero, real content, decent spacing, web-safe fonts. Inline all CSS in a \`<style>\` tag so the page renders with zero asset round-trips.
+- Use semantic HTML (\`<header>\`, \`<main>\`, \`<section>\`, \`<footer>\`). Set a reasonable \`<title>\` and viewport meta.
+- Color: pick a tasteful palette from the brief (or a sensible default). Don't ship default-browser white-on-white.
+- Be self-contained. No external CDNs, no remote images (no network during screenshot).
+- Don't over-engineer. ONE page, ONE screenshot is plenty. Skip JS unless the brief asks for interactivity.
+
+# FAILURE MODES
+- If \`anvilScreenshot\` errors (Playwright missing, port refused): use \`anvilSay\` to report the URL anyway, then call \`done\` with a summary noting the screenshot failed but the localhost URL works. NEVER fabricate a screenshot success.
+- If a tool input is rejected, READ THE ERROR, FIX THE INPUT, RETRY ONCE. After two failures on the same tool, switch strategy.
+
+# DONE CONDITION
+ALL of:
+- ≥1 file written via \`anvilWriteFile\`.
+- \`anvilServe\` returned a URL.
+- \`anvilScreenshot\` returned a \`file_upload_id\` (or the screenshot failure is documented via \`anvilSay\`).
+- ≥1 \`anvilEmbedImage\` (skipped only if screenshot failed).
+- ≥1 \`anvilSay\` with the live URL on the project root.
+- \`done({ summary })\` called.
+
+Target: 8-15 tool calls. Step budget: 20.`;
+
+const ANVIL_STEP_BUDGET = 20;
+const ANVIL_TASK_BUDGET = 80_000;
+
+export function getAnvilSpec(): AgentSpec {
+	return {
+		name: "Anvil",
+		model: HAIKU,
+		stepBudget: ANVIL_STEP_BUDGET,
+		taskBudgetTokens: ANVIL_TASK_BUDGET,
+		maxTokens: SUBAGENT_MAX_TOKENS,
+		systemPrompt: ANVIL_SYSTEM,
+		toolNames: getToolNamesForAgent("Anvil"),
 	};
 }

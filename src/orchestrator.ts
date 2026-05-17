@@ -333,11 +333,22 @@ async function runAgentStage(args: {
 	}
 }
 
+/**
+ * Outcome of an orchestrator run. Callers (webhook handler, rescue sync)
+ * use this to decide whether to count the run as a success or an error.
+ * The orchestrator's top-level try/catch already records the failure to
+ * Notion via reportChainFailure / postComment + Status=Failed; this struct
+ * is the structured signal the in-process caller needs.
+ */
+export type OrchestratorResult =
+	| { ok: true }
+	| { ok: false; stage: string; error: string };
+
 export async function runOrchestratorForBrief(args: {
 	notion: Client;
 	brief: BriefContext;
 	botUserId: string | undefined;
-}): Promise<void> {
+}): Promise<OrchestratorResult> {
 	const { notion, brief } = args;
 	const pageId = brief.pageId;
 	let stage = "start";
@@ -351,7 +362,15 @@ export async function runOrchestratorForBrief(args: {
 				pageId,
 				"Budget circuit-breaker tripped on a previous run. To retry, expand the '🔒 Hivemind internal state' toggle on this brief and clear the JSON.",
 			);
-			return;
+			await setBriefProperties(notion, pageId, {
+				status: "Failed",
+				owner: null,
+			});
+			return {
+				ok: false,
+				stage: "budget-circuit",
+				error: "budgetCircuitTripped — previous run exhausted the token budget",
+			};
 		}
 
 		stage = "classify";
@@ -410,7 +429,11 @@ export async function runOrchestratorForBrief(args: {
 		} catch (err) {
 			await logAgentError(notion, pacer, activityPageId, "Architect", err);
 			await handleAgentError(notion, pageId, "Architect", tokenBudget, err);
-			return;
+			return {
+				ok: false,
+				stage: "agent:Architect",
+				error: err instanceof Error ? err.message : String(err),
+			};
 		}
 
 		stage = "agent:Sentinel";
@@ -431,7 +454,11 @@ export async function runOrchestratorForBrief(args: {
 		} catch (err) {
 			await logAgentError(notion, pacer, activityPageId, "Sentinel", err);
 			await handleAgentError(notion, pageId, "Sentinel", tokenBudget, err);
-			return;
+			return {
+				ok: false,
+				stage: "agent:Sentinel",
+				error: err instanceof Error ? err.message : String(err),
+			};
 		}
 
 		stage = "sentinel-verdict";
@@ -460,9 +487,16 @@ export async function runOrchestratorForBrief(args: {
 		await mergeHivemindState(notion, pageId, {
 			tokensUsed: tokenBudget.usage,
 		});
+
+		return { ok: true };
 	} catch (err) {
 		console.error("[orchestrator] failed at stage", stage, err);
 		await reportChainFailure(notion, pageId, stage, err);
+		return {
+			ok: false,
+			stage,
+			error: err instanceof Error ? err.message : String(err),
+		};
 	}
 }
 

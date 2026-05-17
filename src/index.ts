@@ -3,12 +3,15 @@ import { isFullPage } from "@notionhq/client";
 import type { PageObjectResponse } from "@notionhq/client";
 import { WebhookVerificationError, Worker } from "@notionhq/workers";
 import { j } from "@notionhq/workers/schema-builder";
+import * as Schema from "@notionhq/workers/schema";
 import Pusher from "pusher";
 
+import { acquireChainLock, releaseChainLock } from "./lock";
 import { handleBriefApproved, runOrchestratorForBrief } from "./orchestrator";
 import { ALL_CATEGORIES, classifyBrief, type Category } from "./classify";
 import { getBriefContext } from "./notion";
 import { provisionProject } from "./provision";
+import { runTriagedRescuePass } from "./rescue";
 import { mergeHivemindState, readHivemindState } from "./state";
 
 const worker = new Worker();
@@ -22,9 +25,21 @@ const FORGE_LOCAL_TRIGGER_STATUSES = new Set(["Triaged", "Provisioned"]);
 let pusherClient: Pusher | null = null;
 let pusherWarningLogged = false;
 
-const CHAIN_LOCK_TTL_MS = 15 * 60 * 1000;
-const LOCK_VERIFY_DELAY_MS = 750;
-const CHAIN_COALESCE_MS = 10_000;
+// Managed-database handle required by the Workers sync API. The rescue
+// sync writes nothing to it — the orchestrator's real state lives in the
+// 🔒 Hivemind internal state toggle on each brief page. We declare a
+// single-property schema so the SDK is satisfied and the migration is
+// effectively a no-op on every deploy.
+const hivemindSystemDb = worker.database("hivemindSystem", {
+	type: "managed",
+	initialTitle: "Hivemind System",
+	primaryKeyProperty: "Name",
+	schema: {
+		properties: {
+			Name: Schema.title(),
+		},
+	},
+});
 
 worker.tool("notionWhoAmI", {
 	title: "Notion Who Am I",
@@ -102,7 +117,7 @@ worker.tool("classifyBrief", {
 worker.tool("provisionProject", {
 	title: "Provision Project Subtree",
 	description:
-		"Admin/QA: provision the Notion project subtree for a brief (idempotent). Phase 4: layout is unified — every brief gets Plan + Drafts DB + Answer anchor + mini-DBs + Activity, regardless of Category. The `category` argument is informational only (drives the project icon and dashboard caption). If omitted, it's read from the brief's Category property, defaulting to 'deep'.",
+		"Admin/QA: provision the Notion project subtree for a brief (idempotent). Layout depends on category — writing/quick get an inline answer page (no Drafts DB); others get the full Plan/Drafts/Activity layout. If category is omitted, it's read from the brief's Category property (defaults to 'deep').",
 	schema: j.object({
 		briefId: j.string(),
 		category: j.string().nullable(),
@@ -217,86 +232,6 @@ async function pusherPublish(briefId: string): Promise<void> {
 	} catch (err) {
 		console.warn("[pusherPublish] failed to publish Anvil dispatch:", err);
 	}
-}
-
-async function acquireChainLock(args: {
-	notion: import("@notionhq/client").Client;
-	pageId: string;
-	deliveryId: string;
-}): Promise<boolean> {
-	const { notion, pageId, deliveryId } = args;
-	const now = Date.now();
-
-	const fresh = await readHivemindState(notion, pageId);
-	if (fresh.chainRunning) {
-		const startedAt = Date.parse(fresh.chainRunning.startedAt);
-		if (Number.isFinite(startedAt) && now - startedAt < CHAIN_LOCK_TTL_MS) {
-			console.log(
-				"[lock] chain already running for",
-				pageId,
-				"since",
-				fresh.chainRunning.startedAt,
-				"owner-delivery=",
-				fresh.chainRunning.deliveryId,
-				"— skip",
-				deliveryId,
-			);
-			return false;
-		}
-		console.log(
-			"[lock] stale lock for",
-			pageId,
-			"from",
-			fresh.chainRunning.startedAt,
-			"— overriding with",
-			deliveryId,
-		);
-	}
-
-	if (fresh.lastChainStartedAt) {
-		const lastStartedAt = Date.parse(fresh.lastChainStartedAt);
-		if (
-			Number.isFinite(lastStartedAt) &&
-			now - lastStartedAt < CHAIN_COALESCE_MS
-		) {
-			console.log(
-				"[lock] coalesced — chain started",
-				now - lastStartedAt,
-				"ms ago for",
-				pageId,
-				"— skip",
-				deliveryId,
-			);
-			return false;
-		}
-	}
-
-	const startedAtIso = new Date(now).toISOString();
-	await mergeHivemindState(notion, pageId, {
-		chainRunning: {
-			startedAt: startedAtIso,
-			deliveryId,
-		},
-		lastChainStartedAt: startedAtIso,
-	});
-
-	await new Promise((resolve) => setTimeout(resolve, LOCK_VERIFY_DELAY_MS));
-
-	const afterWait = await readHivemindState(notion, pageId);
-	if (afterWait.chainRunning?.deliveryId !== deliveryId) {
-		console.log(
-			"[lock] lost race for",
-			pageId,
-			"winner=",
-			afterWait.chainRunning?.deliveryId,
-			"— abort",
-			deliveryId,
-		);
-		return false;
-	}
-
-	console.log("[lock] acquired", pageId, "delivery=", deliveryId);
-	return true;
 }
 
 function extractPageId(body: Record<string, unknown>): string | undefined {
@@ -451,12 +386,23 @@ worker.webhook("onBriefStatusChange", {
 					continue;
 				}
 				try {
-					await runOrchestratorForBrief({ notion, brief, botUserId });
-					console.log("[onBriefStatusChange] orchestrator complete for", pageId);
+					const result = await runOrchestratorForBrief({ notion, brief, botUserId });
+					if (result.ok) {
+						console.log("[onBriefStatusChange] orchestrator complete for", pageId);
+					} else {
+						console.error(
+							"[onBriefStatusChange] orchestrator failed for",
+							pageId,
+							"stage=",
+							result.stage,
+							"error=",
+							result.error,
+						);
+					}
 				} finally {
+					await releaseChainLock({ notion, pageId });
 					await mergeHivemindState(notion, pageId, {
 						lastDeliveryId: event.deliveryId,
-						chainRunning: undefined,
 					});
 				}
 			} else {
@@ -470,5 +416,49 @@ worker.webhook("onBriefStatusChange", {
 				await mergeHivemindState(notion, pageId, { lastDeliveryId: event.deliveryId });
 			}
 		}
+	},
+});
+
+// triagedRescue — scheduled backstop for `onBriefStatusChange`. The webhook
+// is the primary trigger but shares a per-capability delivery budget; a
+// burst (e.g. a mis-scoped Notion automation firing on every property
+// change) can exhaust that budget and lock the webhook out for ~30 min.
+// This sync runs on its OWN per-capability budget every 2 minutes, queries
+// the Briefs DS for Status=Triaged, acquires the same chain lock as the
+// webhook, and dispatches the orchestrator on whatever the webhook missed.
+// See AGENTS.md §"Rate-limit defenses for onBriefStatusChange".
+worker.sync("triagedRescue", {
+	database: hivemindSystemDb,
+	mode: "incremental",
+	schedule: "2m",
+	execute: async (_state, { notion }) => {
+		const dataSourceId = process.env.HIVEMIND_BRIEFS_DATA_SOURCE_ID;
+		if (!dataSourceId) {
+			console.warn(
+				"[triagedRescue] HIVEMIND_BRIEFS_DATA_SOURCE_ID not set; skipping pass.",
+			);
+			return { changes: [], hasMore: false };
+		}
+		const botUserId = process.env.HIVEMIND_BOT_USER_ID;
+		await runTriagedRescuePass({ notion, dataSourceId, botUserId });
+		return { changes: [], hasMore: false };
+	},
+});
+
+worker.tool("runRescueSweep", {
+	title: "Run Rescue Sweep (Admin)",
+	description:
+		"Admin/QA: manually invoke the `triagedRescue` sweep right now. Returns the same counts the scheduled sync logs (scanned/acquired/processed/skipped/errors). Useful for testing without waiting for the next 2-minute tick.",
+	schema: j.object({}),
+	execute: async (_input, { notion }) => {
+		const dataSourceId = process.env.HIVEMIND_BRIEFS_DATA_SOURCE_ID;
+		if (!dataSourceId) {
+			throw new Error(
+				"HIVEMIND_BRIEFS_DATA_SOURCE_ID is not set. Add it to .env locally and run `ntn workers env push`.",
+			);
+		}
+		const botUserId = process.env.HIVEMIND_BOT_USER_ID;
+		const result = await runTriagedRescuePass({ notion, dataSourceId, botUserId });
+		return JSON.parse(JSON.stringify(result));
 	},
 });
