@@ -279,8 +279,15 @@ const NOTION_RICH_TEXT_LIMIT = 1900;
 function chunk(text: string, size = NOTION_RICH_TEXT_LIMIT): string[] {
 	if (text.length <= size) return [text];
 	const out: string[] = [];
-	for (let i = 0; i < text.length; i += size) {
-		out.push(text.slice(i, i + size));
+	let i = 0;
+	while (i < text.length) {
+		let end = Math.min(i + size, text.length);
+		if (end < text.length) {
+			const lastSpace = text.lastIndexOf(" ", end);
+			if (lastSpace > i + size / 2) end = lastSpace + 1;
+		}
+		out.push(text.slice(i, end));
+		i = end;
 	}
 	return out;
 }
@@ -294,6 +301,10 @@ function rt(content: string): { type: "text"; text: { content: string } }[] {
 
 export function heading2(text: string): BlockObjectRequest {
 	return { type: "heading_2", heading_2: { rich_text: rt(text) } };
+}
+
+export function heading1(text: string): BlockObjectRequest {
+	return { type: "heading_1", heading_1: { rich_text: rt(text) } };
 }
 
 export function heading3(text: string): BlockObjectRequest {
@@ -413,6 +424,81 @@ export function mdToBlocks(md: string): BlockObjectRequest[] {
 
 	flushPara();
 	return out;
+}
+
+export function divider(): BlockObjectRequest {
+	return { type: "divider", divider: {} };
+}
+
+export function callout(
+	text: string,
+	emoji?: string,
+	color?: string,
+	children?: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		type: "callout",
+		callout: {
+			rich_text: rt(text),
+			icon: emoji ? { type: "emoji", emoji: emoji as never } : undefined,
+			color: (color ?? "default") as never,
+			children: children as never,
+		},
+	};
+}
+
+export function tableOfContents(color = "gray"): BlockObjectRequest {
+	return {
+		type: "table_of_contents",
+		table_of_contents: { color: color as never },
+	};
+}
+
+export function columnList(
+	columns: { widthRatio?: number; children: BlockObjectRequest[] }[],
+): BlockObjectRequest {
+	return {
+		type: "column_list",
+		column_list: {
+			children: columns.map((column) => ({
+				type: "column",
+				column: {
+					width_ratio: column.widthRatio,
+					children: column.children,
+				},
+			})),
+		} as never,
+	};
+}
+
+export function toggle(
+	text: string,
+	children?: BlockObjectRequest[],
+): BlockObjectRequest {
+	return {
+		type: "toggle",
+		toggle: {
+			rich_text: rt(text),
+			children: (children ?? []) as never,
+		},
+	};
+}
+
+export function todoBlock(text: string, checked?: boolean): BlockObjectRequest {
+	return {
+		type: "to_do",
+		to_do: {
+			rich_text: rt(text),
+			checked: checked ?? false,
+		},
+	};
+}
+
+export function bookmark(url: string): BlockObjectRequest {
+	return {
+		type: "bookmark",
+		bookmark: { url },
+	};
 }
 
 export async function reportChainFailure(
