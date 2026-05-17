@@ -200,7 +200,11 @@ export async function provisionWorkspaceHome(args: {
 		type: "board",
 		configuration: {
 			type: "board",
-			group_by: { type: "select", property_id: "Status", group_by: "value" },
+			group_by: {
+				type: "select",
+				property_id: "Status",
+				sort: { type: "manual" },
+			},
 		},
 	});
 	if (briefsView) {
@@ -235,7 +239,11 @@ export async function provisionWorkspaceHome(args: {
 		type: "board",
 		configuration: {
 			type: "board",
-			group_by: { type: "select", property_id: "Status", group_by: "value" },
+			group_by: {
+				type: "select",
+				property_id: "Status",
+				sort: { type: "manual" },
+			},
 		},
 	});
 	await safeCreateView(notion, {
@@ -293,7 +301,11 @@ export async function provisionWorkspaceHome(args: {
 		type: "board",
 		configuration: {
 			type: "board",
-			group_by: { type: "select", property_id: "Op", group_by: "value" },
+			group_by: {
+				type: "select",
+				property_id: "Op",
+				sort: { type: "manual" },
+			},
 		},
 	});
 

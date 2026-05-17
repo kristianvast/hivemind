@@ -229,7 +229,7 @@ export async function ensureRunsViews(args: {
 				group_by: {
 					type: "select",
 					property_id: propIds.status,
-					group_by: "value",
+					sort: { type: "manual" },
 				},
 			},
 		},
@@ -241,7 +241,7 @@ export async function ensureRunsViews(args: {
 				group_by: {
 					type: "select",
 					property_id: propIds.agent,
-					group_by: "value",
+					sort: { type: "manual" },
 				},
 			},
 		},
@@ -250,8 +250,8 @@ export async function ensureRunsViews(args: {
 			type: "timeline",
 			configuration: {
 				type: "timeline",
-				start_property_id: propIds.started,
-				end_property_id: propIds.finished,
+				date_property_id: propIds.started,
+				end_date_property_id: propIds.finished,
 			},
 		},
 		{
