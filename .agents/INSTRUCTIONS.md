@@ -37,7 +37,11 @@ A brief (Notion DB row) flips to `Status=Triaged` → the `onBriefStatusChange` 
 
 **Status state machine (current):** `Backlog → Triaged → In Progress → Needs Review → Done | Failed`. The Architect drives Status. Sentinel sets the verdict that decides `Needs Review` (approve) vs leaves `In Progress` (needs-revision).
 
-**Anvil branch (planned, not fully implemented).** Anvil is the local-executor daemon in [`anvil/`](anvil/README.md) — a Node daemon on the user's Mac that drives a real Linux VM + Playwright browser + GitHub remote. The dispatch wiring is in place: admin sets `Owner=Forge-Local` + Status in `{Triaged, Provisioned}`, the webhook publishes `{briefId}` to Pusher channel `anvil-dispatch`, Anvil picks it up and executes locally, writes proof + PR back to the subtree, flips Status to `Done`. **The full v2 integration is deferred to Phase 3**, which replaces the `Owner=Forge-Local` indirection with a direct `delegateAnvil` tool the Architect calls. Until Phase 3 lands, treat Anvil as an out-of-band path — the Architect does not invoke it.
+**Anvil — local execution sub-agent (✅ wired, in-process).** Anvil is the only Hivemind sub-agent that touches the local filesystem, spins up a localhost HTTP server, and drives a real headless Chromium via Playwright. It runs **only in `--local` orchestrator mode** (e.g. `ntn workers exec runOrchestrator --local`). The Architect calls `delegateAnvil({ task, context })` when a brief is about BUILDING and DEMONSTRATING something visual (website, landing page, UI mockup). Anvil writes its own proof (image block + URL callout) into the project root via dedicated tools (`anvilWriteFile`, `anvilServe`, `anvilScreenshot`, `anvilEmbedImage`, `anvilSay`) and returns a summary to the Architect.
+
+Anvil sessions are per-brief, owned by `src/anvil.ts`. Each session has a temp directory under `os.tmpdir()/hivemind-anvil-<briefId>-<ts>/` plus an `http.Server` bound to 127.0.0.1 on an auto-allocated port. **The HTTP server is intentionally NOT `unref()`d** — it keeps the Node event loop alive past `runOrchestrator`'s return so the human can visit the URL. `runOrchestrator` prints an `⚒️  ANVIL SERVERS STILL RUNNING` banner with the URLs after it finishes; Ctrl+C exits.
+
+The original `anvil/` daemon (Pusher subscriber + E2B/Lima VMs + GitHub PRs) in [`anvil/`](anvil/README.md) is **separate** from this in-process Anvil and remains available for the heavier dispatched-execution use case (driven by `Owner=Forge-Local` + Pusher channel `anvil-dispatch` — wiring stays in `src/index.ts`). The two paths can coexist: in-process Anvil for visual local demos invoked by the Architect, and the daemon for VM-based code execution + PRs.
 
 **Per-brief subtree** (provisioned in `src/provision.ts`, idempotent). **Unified layout (Phase 4)** — every brief, regardless of Category, gets the same shape:
 
@@ -57,7 +61,7 @@ The Architect picks writeAnswer (inline prose) vs createDraft (iterative artifac
 | Librarian  | `delegateLibrarian`  | ✅ wired   | External docs / web reference research |
 | Oracle     | `delegateOracle`     | ✅ wired   | Deep analysis (extended thinking, read-only) |
 | Sentinel   | (fixed post-step)    | 🟡 partial | Currently invoked as a fixed post-step in `orchestrator.ts`. Phase 3 migrates this to `delegateSentinel`. |
-| Anvil      | (Pusher dispatch)    | 📋 planned | Dispatch wiring exists (`Owner=Forge-Local` → Pusher). Architect-driven `delegateAnvil` is Phase 3 — not in use yet. |
+| Anvil      | `delegateAnvil`      | ✅ wired   | **In-process, `--local` mode only.** Local filesystem + localhost HTTP server + Playwright headless Chromium. Architect uses it for build-and-demo briefs (websites, UI mockups). See `src/anvil.ts` and `getAnvilSpec()` in `src/subagents.ts`. The separate `anvil/` daemon is the Pusher-dispatched, VM-backed alternative for code execution + GitHub PRs. |
 
 **Scope rule.** Agent writes MUST be inside the brief's project subtree. Enforced by `src/scope.ts` — violations are caught and reported, not silently dropped.
 
@@ -81,17 +85,40 @@ The Architect picks writeAnswer (inline prose) vs createDraft (iterative artifac
 | `provisionProject`       | tool     | Admin: idempotently provision the subtree for a brief |
 | `debugState`             | tool     | Admin: pretty-print HivemindState JSON |
 | `runOrchestrator`        | tool     | Admin: invoke v2 orchestrator directly on a brief — bypasses webhook auth / chain lock / dedup. Use for `ntn workers exec runOrchestrator --local`. |
-| `onBriefStatusChange`    | webhook  | Chain trigger. Verifies `X-Hivemind-Secret`, dedups by `deliveryId`, filters trash + bot edits. Routes: `Status=Triaged` → orchestrator; `Status=Done` → `handleBriefApproved`; `Owner=Forge-Local` + Status in `{Triaged, Provisioned}` → Pusher publish (best-effort). |
+| `runRescueSweep`         | tool     | Admin: manually invoke the `triagedRescue` sweep. Returns counts (scanned/acquired/processed/skipped/errors). Same code path as the scheduled sync, useful for testing without waiting 2 min. |
+| `onBriefStatusChange`    | webhook  | Chain trigger. Verifies `X-Hivemind-Secret`, runs the storm gate, filters trash + bot edits, then routes by Status read directly from page properties. `Status=Triaged` → acquire chain lock → orchestrator; `Status=Done` → `handleBriefApproved`; `Owner=Forge-Local` + Status in `{Triaged, Provisioned}` → Pusher publish (best-effort). Non-trigger deliveries early-exit after a single `pages.retrieve` call (no state read, no body read). |
+| `triagedRescue`          | sync     | Scheduled every 2 min. Queries the Briefs DS for `Status=Triaged`, acquires the same chain lock as the webhook, and runs the orchestrator on whatever the webhook missed. Backstop against webhook rate-limit lockouts. Writes nothing to its managed `Hivemind System` DB (the DB is a sync-API requirement, not a state store). |
 
-### Rate-limit hygiene for `onBriefStatusChange` (READ THIS)
+### Rate-limit defenses for `onBriefStatusChange` (READ THIS)
 
-The webhook is **per-capability rate-limited**. A burst can blow the budget and lock the capability out for ~30 min — visible as runs with empty logs + exit code 1 + ~50 ms duration. Three lines of defense; change one without the others and the budget gets tight:
+The webhook is **per-capability rate-limited** by the Notion Workers platform. A burst can blow the budget and lock the capability out for ~30 min — visible as runs with empty logs + exit code 1 + ~50 ms duration. The defenses below are layered so any single misconfiguration cannot strand briefs at Triaged:
 
-1. **Worker filters bot-authored edits** — checks `page.last_edited_by.id` against `HIVEMIND_BOT_USER_ID`. Without this, every Status write the Architect/sub-agents make would loop back through the webhook. Keep `HIVEMIND_BOT_USER_ID` in `.env` and pushed via `ntn workers env push`.
-2. **Worker coalesces rapid retriggers** within `CHAIN_COALESCE_MS` (10 s) in `acquireChainLock`. Absorbs Notion automation retry storms; human-paced retries (Triaged → Needs Review → Triaged) are unaffected (always > 10 s).
-3. **Notion automation must filter on the right transitions.** In the Briefs DB, edit the automation that fires this webhook and set its trigger to `Status is Triaged` OR `Status is Done` (+ `Owner is Forge-Local` for the Anvil path). The default "any property change" trigger is the single biggest source of wasted deliveries. No code-side fallback — the Worker must receive the delivery before it can early-return, and the early-return still costs a rate-limit slot.
+1. **In-memory storm gate (`src/index.ts`)** — per-page sliding window. If a single page produces > 12 deliveries inside 10 seconds, suppress further deliveries to that page for 90 s with ZERO Notion API calls. Protects the platform delivery budget for other pages. Best-effort records `state.storm` once on trip for observability.
+2. **Chain lock + coalesce (`src/lock.ts`)** — shared between webhook and rescue sync. `CHAIN_LOCK_TTL_MS` (15 min) prevents concurrent orchestrator runs on the same brief; `CHAIN_COALESCE_MS` (10 s) absorbs Notion automation retry storms while leaving human-paced retries unaffected.
+3. **Bot-edit filter** — checks `page.last_edited_by.id` against `HIVEMIND_BOT_USER_ID`. Without this, every Status write the Architect/sub-agents make would loop back through the webhook. Keep `HIVEMIND_BOT_USER_ID` in `.env` and pushed via `ntn workers env push`.
+4. **Fast-path early-exit** — non-Triaged/non-Done deliveries no longer read state or the page body. The Status check is done directly from `page.properties` (already in the `pages.retrieve` response). Reduces per-delivery Notion API calls from 6–9 to 1.
+5. **Rescue sync backstop (`src/rescue.ts`, `worker.sync("triagedRescue")`)** — runs every 2 minutes on its own per-capability budget. Catches any `Status=Triaged` brief the webhook missed. **This is the layer that makes "Triaged stays stuck forever" mathematically impossible.** Even if the webhook is completely locked out, the sync runs and processes the backlog.
+6. **Notion automation trigger scoping** — in the Briefs DB, the automation that fires this webhook MUST be scoped to `Status is Triaged` OR `Status is Done` (+ `Owner is Forge-Local` for the Anvil path). The default "any property change" trigger is the single biggest source of wasted deliveries. Use `npx tsx scripts/automationCanary.ts <briefId>` to detect over-firing.
 
-If a brief is stuck: `ntn workers runs list --plain | head -n 20`. A wall of exit-1 + empty-log + ~50 ms runs is the rate-limit signature. Wait for the window to drain (the 429 says `Retry after N seconds`), or `ntn workers deploy` resets it.
+#### Validating the setup
+
+```
+set -a; source .env; set +a
+npx tsx scripts/validateBriefsDb.ts         # checks DB schema + env vars
+npx tsx scripts/automationCanary.ts <briefId>   # edits a non-Status prop, verifies webhook does NOT fire
+```
+
+Create the canary brief as a regular brief at `Status=Backlog` with a `Canary Nonce` rich_text property (add via the Notion UI). Set `HIVEMIND_AUTOMATION_CANARY_BRIEF_ID=<page-id>` in `.env` to default the script argument.
+
+#### Symptom → action runbook
+
+| Symptom | Action |
+|---|---|
+| Brief moved to Triaged sits there for > 2 min | Wait one more minute; the rescue sync runs every 2 min. If still stuck after 5 min, check `ntn workers runs list --plain \| head -n 20` for the rate-limit signature. |
+| Wall of exit-1 + empty-log + ~50 ms webhook runs | Webhook is rate-limited. `ntn workers deploy` resets it. Rescue sync will catch up briefs in the meantime. |
+| `[storm] tripped for <pageId>` in webhook logs | Notion automation is firing too broadly on `<pageId>`. Run `npx tsx scripts/automationCanary.ts <pageId>` to confirm; fix the automation trigger to scope on `Status is Triaged`. |
+| Brief stuck `In Progress` with `Owner=Architect` and no recent activity | Orchestrator crashed mid-run. `ntn workers exec runOrchestrator --local -d '{"briefId":"<id>"}'` re-runs it; the chain lock auto-clears. |
+| Brief stuck `Triaged`, state shows `budgetCircuitTripped: true` | Previous run hit the 400k token safety net. The orchestrator now sets `Status=Failed` automatically; expand the `🔒 Hivemind internal state` toggle on the brief and clear the JSON, then flip Status back to Triaged. |
 
 ## Documentation Lookup (notion-docs MCP)
 

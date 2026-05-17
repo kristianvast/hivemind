@@ -27,7 +27,6 @@ import {
 	bullet,
 	callout,
 	divider,
-	heading3,
 	paragraph,
 	toggle,
 	type BriefContext,
@@ -40,6 +39,7 @@ import { provisionProject, type ProjectIds } from "./provision";
 import { failRun, finishRun, startRun, type RunAgent } from "./runs";
 import { ScopeGuard, ScopeViolation } from "./scope";
 import { mergeHivemindState, readHivemindState } from "./state";
+import { updateStatusHero } from "./statusHero";
 import { getSentinelSpec } from "./subagents";
 import { getWorkspaceHomeIdsFromEnv } from "./workspaceHome";
 
@@ -102,34 +102,12 @@ async function writeBriefCategory(
 	});
 }
 
-async function logAgentStart(
-	notion: Client,
-	pacer: Pacer,
-	activityPageId: string,
-	agent: ActivityAgent,
-): Promise<void> {
-	try {
-		await pacer.acquire();
-		await appendBlocks(notion, activityPageId, [
-			callout(
-				`${agent} started — ${timestamp()}`,
-				AGENT_EMOJI[agent],
-				"blue_background",
-			),
-		]);
-	} catch (err) {
-		console.warn(`[orchestrator] logAgentStart(${agent}) failed:`, err);
-	}
-}
-
 interface AgentFinishArgs {
 	activityPageId: string;
 	agent: ActivityAgent;
 	stepCount: number;
 	durationMs: number;
 	tokensDelta: number;
-	cacheCreate: number;
-	cacheRead: number;
 	doneSummary?: string;
 	verdict?: { verdict: "approve" | "needs-revision"; summary: string };
 }
@@ -140,32 +118,30 @@ async function logAgentFinish(
 	args: AgentFinishArgs,
 ): Promise<void> {
 	try {
-		const { agent, stepCount, durationMs, tokensDelta, cacheCreate, cacheRead } = args;
+		const { agent, stepCount, durationMs, tokensDelta } = args;
 		const emoji = AGENT_EMOJI[agent];
-		const headline = `${emoji} ${agent} · ${timestamp()} · ${stepCount} tools · ${formatDuration(durationMs)} · ${formatTokens(tokensDelta)} tokens`;
+		const verdictBadge = args.verdict
+			? args.verdict.verdict === "approve"
+				? " · ✅ approved"
+				: " · 🔁 needs revision"
+			: "";
+		const headline = `${emoji} ${agent} · ${formatDuration(durationMs)} · ${stepCount} tools · ${formatTokens(tokensDelta)} tokens${verdictBadge}`;
 
 		const children: BlockObjectRequestLike[] = [];
 
-		const metrics: string[] = [
-			`${stepCount} tool calls`,
-			formatDuration(durationMs),
-			`${formatTokens(tokensDelta)} tokens`,
-		];
-		if (cacheRead > 0) metrics.push(`${formatTokens(cacheRead)} cache read`);
-		if (cacheCreate > 0) metrics.push(`${formatTokens(cacheCreate)} cache create`);
-		children.push(paragraph(`📊 ${metrics.join(" · ")}`));
-
 		if (args.doneSummary) {
-			children.push(heading3("Summary"));
 			children.push(paragraph(args.doneSummary));
 		}
 
 		if (args.verdict) {
-			children.push(heading3("Verdict"));
 			const v = args.verdict.verdict;
-			const icon = v === "approve" ? "✅" : "🔁";
-			children.push(callout(`${icon} ${v}`, undefined, v === "approve" ? "green_background" : "yellow_background"));
-			children.push(paragraph(args.verdict.summary));
+			children.push(
+				callout(
+					args.verdict.summary,
+					v === "approve" ? "✅" : "🔁",
+					v === "approve" ? "green_background" : "yellow_background",
+				),
+			);
 		}
 
 		await pacer.acquire();
@@ -248,7 +224,6 @@ async function runAgentStage(args: {
 		status: "In Progress",
 		owner: owner as "Architect" | "Sentinel",
 	});
-	await logAgentStart(notion, pacer, activityPageId, agentLabel);
 
 	const runsDsId = projectIds.dbs.runs?.dsId;
 	const runAgentName = agentLabel as RunAgent;
@@ -308,8 +283,6 @@ async function runAgentStage(args: {
 			stepCount: invocation.result.toolCallsConsumed,
 			durationMs,
 			tokensDelta,
-			cacheCreate: invocation.result.cacheStats.cacheCreationInputTokens,
-			cacheRead: invocation.result.cacheStats.cacheReadInputTokens,
 			doneSummary: invocation.doneSummary,
 			verdict: invocation.verdict,
 		});
@@ -365,6 +338,9 @@ export async function runOrchestratorForBrief(args: {
 			await setBriefProperties(notion, pageId, {
 				status: "Failed",
 				owner: null,
+				verdict: "failed",
+				verdictSummary:
+					"Budget circuit-breaker tripped on a previous run. Clear the 🔒 Hivemind state toggle on this brief to retry.",
 			});
 			return {
 				ok: false,
@@ -412,6 +388,16 @@ export async function runOrchestratorForBrief(args: {
 			"sequence=Architect→Sentinel",
 		);
 
+		const chainStartedAt = new Date().toISOString();
+		const chainStartMs = Date.now();
+		const heroId = projectIds.statusHeroBlockId;
+		await mergeHivemindState(notion, pageId, { chainStartedAt });
+		await updateStatusHero(notion, pacer, heroId, {
+			kind: "running",
+			agent: "Architect",
+			startedAt: chainStartedAt,
+		});
+
 		stage = "agent:Architect";
 		try {
 			await runAgentStage({
@@ -428,6 +414,11 @@ export async function runOrchestratorForBrief(args: {
 			});
 		} catch (err) {
 			await logAgentError(notion, pacer, activityPageId, "Architect", err);
+			await updateStatusHero(notion, pacer, heroId, {
+				kind: "failed",
+				stage: "agent:Architect",
+				errorMsg: err instanceof Error ? err.message : String(err),
+			});
 			await handleAgentError(notion, pageId, "Architect", tokenBudget, err);
 			return {
 				ok: false,
@@ -435,6 +426,12 @@ export async function runOrchestratorForBrief(args: {
 				error: err instanceof Error ? err.message : String(err),
 			};
 		}
+
+		await updateStatusHero(notion, pacer, heroId, {
+			kind: "running",
+			agent: "Sentinel",
+			startedAt: new Date().toISOString(),
+		});
 
 		stage = "agent:Sentinel";
 		let sentinelInvocation: Awaited<ReturnType<typeof invokeAgent>>;
@@ -453,6 +450,11 @@ export async function runOrchestratorForBrief(args: {
 			});
 		} catch (err) {
 			await logAgentError(notion, pacer, activityPageId, "Sentinel", err);
+			await updateStatusHero(notion, pacer, heroId, {
+				kind: "failed",
+				stage: "agent:Sentinel",
+				errorMsg: err instanceof Error ? err.message : String(err),
+			});
 			await handleAgentError(notion, pageId, "Sentinel", tokenBudget, err);
 			return {
 				ok: false,
@@ -462,16 +464,38 @@ export async function runOrchestratorForBrief(args: {
 		}
 
 		stage = "sentinel-verdict";
+		const totalDurationMs = Date.now() - chainStartMs;
 		if (sentinelInvocation.verdict) {
+			const summaryText = sentinelInvocation.verdict.summary;
 			if (sentinelInvocation.verdict.verdict === "needs-revision") {
 				await setBriefProperties(notion, pageId, {
 					status: "Needs Review",
 					owner: null,
+					verdict: "needs-revision",
+					verdictSummary: summaryText,
+				});
+				await updateStatusHero(notion, pacer, heroId, {
+					kind: "needs-revision",
+					durationMs: totalDurationMs,
+					tokens: tokenBudget.usage,
+					verdictSummary: summaryText,
 				});
 			} else {
-				await setBriefProperties(notion, pageId, { owner: null });
+				await setBriefProperties(notion, pageId, {
+					owner: null,
+					verdict: "approve",
+					verdictSummary: summaryText,
+				});
+				await updateStatusHero(notion, pacer, heroId, {
+					kind: "approved",
+					durationMs: totalDurationMs,
+					tokens: tokenBudget.usage,
+					verdictSummary: summaryText,
+				});
 			}
 		} else {
+			const fallbackSummary =
+				"Sentinel did not call setVerdict. Marked Needs Review for manual triage.";
 			await postComment(
 				notion,
 				pageId,
@@ -480,6 +504,14 @@ export async function runOrchestratorForBrief(args: {
 			await setBriefProperties(notion, pageId, {
 				status: "Needs Review",
 				owner: null,
+				verdict: "needs-revision",
+				verdictSummary: fallbackSummary,
+			});
+			await updateStatusHero(notion, pacer, heroId, {
+				kind: "needs-revision",
+				durationMs: totalDurationMs,
+				tokens: tokenBudget.usage,
+				verdictSummary: fallbackSummary,
 			});
 		}
 
@@ -491,6 +523,22 @@ export async function runOrchestratorForBrief(args: {
 		return { ok: true };
 	} catch (err) {
 		console.error("[orchestrator] failed at stage", stage, err);
+		try {
+			const state = await readHivemindState(notion, pageId);
+			if (state.statusHeroBlockId) {
+				const pacerLocal = new Pacer(PACER_CONFIG);
+				await updateStatusHero(notion, pacerLocal, state.statusHeroBlockId, {
+					kind: "failed",
+					stage,
+					errorMsg: err instanceof Error ? err.message : String(err),
+				});
+			}
+		} catch (heroErr) {
+			console.warn(
+				"[orchestrator] status hero failure-update skipped:",
+				heroErr,
+			);
+		}
 		await reportChainFailure(notion, pageId, stage, err);
 		return {
 			ok: false,
@@ -520,6 +568,8 @@ async function handleAgentError(
 		await setBriefProperties(notion, pageId, {
 			status: "Failed",
 			owner: null,
+			verdict: "failed",
+			verdictSummary: `Token budget exceeded at ${agentLabel} (${tokenBudget.usage} > ${TOKEN_BUDGET_LIMIT}).`,
 		});
 		return;
 	}
@@ -533,6 +583,8 @@ async function handleAgentError(
 		await setBriefProperties(notion, pageId, {
 			status: "Failed",
 			owner: null,
+			verdict: "failed",
+			verdictSummary: `Scope violation in ${agentLabel}: ${err.message}`,
 		});
 		return;
 	}

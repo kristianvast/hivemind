@@ -37,16 +37,9 @@ import type {
 import type { Category } from "./classify";
 import {
 	appendBlocks,
-	callout,
-	columnList,
-	divider,
-	heading1,
 	heading2,
-	heading3,
 	paragraph,
 	tableOfContents,
-	todoBlock,
-	toggle,
 } from "./notion";
 import {
 	ensureRunsDatabase,
@@ -55,6 +48,7 @@ import {
 } from "./runs";
 import { readHivemindState, writeHivemindState } from "./state";
 import type { DbIds, HivemindState } from "./state";
+import { buildStatusHeroBlock } from "./statusHero";
 
 export type { DbIds } from "./state";
 
@@ -78,6 +72,7 @@ export interface ProjectIds {
 	planPageId: string;
 	activityPageId: string;
 	answerAnchorBlockId: string;
+	statusHeroBlockId: string;
 	dbs: {
 		drafts: DbIds;
 		sources: DbIds;
@@ -97,13 +92,6 @@ const DRAFTS_DB_TITLE = "Drafts";
 const SOURCES_DB_TITLE = "Sources";
 const DECISIONS_DB_TITLE = "Decisions";
 const OPEN_QUESTIONS_DB_TITLE = "Open Questions";
-
-const ROOT_APPROVED_VIEW_TITLE = "✅ Approved output";
-const ROOT_LATEST_VIEW_TITLE = "🕓 Latest iteration";
-const ROOT_NEEDS_REVIEW_VIEW_TITLE = "👀 Needs review";
-const ROOT_OPEN_QUESTIONS_VIEW_TITLE = "❓ Open questions";
-const ROOT_LATEST_DECISIONS_VIEW_TITLE = "✅ Latest decisions";
-const ROOT_SOURCES_VIEW_TITLE = "🔎 Sources";
 
 function projectIcon(
 	category: Category | undefined,
@@ -137,80 +125,13 @@ export const PLAN_SECTIONS = [
 export type PlanSection = (typeof PLAN_SECTIONS)[number];
 
 const PLAN_PAGE_CHILDREN: NonNullable<CreatePageParameters["children"]> = [
-	callout(
-		"How to read this plan",
-		"🧭",
-		"blue_background",
-		[
-			paragraph(
-				"The top-level sections stay short and decision-oriented. Expand the toggles for detailed evidence, assumptions, rejected paths, and handoff notes.",
-			),
-		],
-	),
 	tableOfContents(),
-	divider(),
-	heading2("Context"),
-	callout("What matters about the brief, audience, constraints, and success criteria.", "🎯", "gray_background"),
-	toggle("Research details", [paragraph("_Pending research_")]),
-	heading2("Approach"),
-	callout("Recommended path through the work, kept concise enough for a human reviewer to scan.", "🛠️", "gray_background"),
-	toggle("Assumptions and rejected paths", [paragraph("_Pending Architect_")]),
-	heading2("Decisions"),
-	callout("Significant choices made by the swarm, with rationale.", "✅", "green_background"),
-	paragraph("_Pending Architect_"),
-	heading2("Sources"),
-	callout("Evidence and references the agents relied on.", "🔎", "yellow_background"),
-	paragraph("_Pending research_"),
-	heading2("Open Questions"),
-	callout("Human input needed, unresolved risks, or follow-up opportunities.", "❓", "orange_background"),
-	paragraph("_Pending agents_"),
-	heading2("Status"),
-	callout("Current chain state, latest verdict, and next action.", "📍", "purple_background"),
-	todoBlock("Context captured", false),
-	todoBlock("Deliverable produced", false),
-	todoBlock("Sentinel review complete", false),
 ];
 
-function rootDashboardChildren(
-	category: Category | undefined,
-): NonNullable<CreatePageParameters["children"]> {
-	const categoryLine = category ? `Category: ${category}` : "Category: (unset)";
-	return [
-		heading1("Hivemind workspace"),
-		callout(
-			"This page is the command center for the brief: read the overview, open the deliverable, then inspect Plan and Activity if you want the trail.",
-			"🐝",
-			"yellow_background",
-		),
-		columnList([
-			{
-				widthRatio: 0.34,
-				children: [
-					heading3("Status"),
-					paragraph("Provisioned"),
-					paragraph(categoryLine),
-				],
-			},
-			{
-				widthRatio: 0.33,
-				children: [
-					heading3("Deliverable"),
-					paragraph(
-						"Either inline under the 📄 Answer section above, or as a row in the Drafts database — whichever shape the Architect picks at runtime.",
-					),
-				],
-			},
-			{
-				widthRatio: 0.33,
-				children: [
-					heading3("Next action"),
-					paragraph("Watch the Status section and Activity page for progress."),
-				],
-			},
-		]),
-		tableOfContents(),
-		divider(),
-	];
+function rootDashboardChildren(): NonNullable<
+	CreatePageParameters["children"]
+> {
+	return [buildStatusHeroBlock({ kind: "provisioning" })];
 }
 
 const ACTIVITY_PAGE_CHILDREN: NonNullable<CreatePageParameters["children"]> = [
@@ -252,40 +173,14 @@ const DRAFTS_DB_PROPERTIES: DbPropertiesRequest = {
 	},
 	Summary: { type: "rich_text", rich_text: {} },
 	Sources: { type: "url", url: {} },
-	"Risk Level": {
-		type: "select",
-		select: {
-			options: [
-				{ name: "low", color: "green" },
-				{ name: "medium", color: "yellow" },
-				{ name: "high", color: "red" },
-			],
-		},
-	},
-	"Quality Score": { type: "number", number: { format: "number" } },
 	"Review Count": { type: "number", number: { format: "number" } },
 	"Approved At": { type: "date", date: {} },
-	"Output Type": {
-		type: "select",
-		select: {
-			options: [
-				{ name: "analysis", color: "blue" },
-				{ name: "implementation", color: "orange" },
-				{ name: "writing", color: "purple" },
-				{ name: "design", color: "pink" },
-				{ name: "research", color: "gray" },
-			],
-		},
-	},
 	Proof: { type: "files", files: {} },
 };
 
 const DRAFTS_DB_ENRICHMENT_PROPERTIES: DbPropertiesRequest = {
-	"Risk Level": DRAFTS_DB_PROPERTIES["Risk Level"],
-	"Quality Score": DRAFTS_DB_PROPERTIES["Quality Score"],
 	"Review Count": DRAFTS_DB_PROPERTIES["Review Count"],
 	"Approved At": DRAFTS_DB_PROPERTIES["Approved At"],
-	"Output Type": DRAFTS_DB_PROPERTIES["Output Type"],
 	Proof: DRAFTS_DB_PROPERTIES.Proof,
 };
 
@@ -472,7 +367,10 @@ async function findOrCreateProjectDatabase(
 interface NotionViews {
 	list(args: { database_id?: string; data_source_id?: string }): Promise<{ results: { id: string }[] }>;
 	retrieve(args: { view_id: string }): Promise<{ id: string; name?: string }>;
-	create(args: Record<string, unknown>): Promise<unknown>;
+	create(args: Record<string, unknown>): Promise<{
+		id: string;
+		parent?: { type?: string; database_id?: string };
+	}>;
 }
 
 function notionViews(notion: Client): NotionViews | undefined {
@@ -512,26 +410,6 @@ async function ensureView(
 	});
 }
 
-async function ensureLinkedView(
-	notion: Client,
-	rootId: string,
-	scan: RootScan,
-	dataSourceId: string,
-	name: string,
-	type: string,
-	extra: Record<string, unknown> = {},
-): Promise<void> {
-	const views = notionViews(notion);
-	if (!views || scan.childDbsByTitle.has(name)) return;
-	await views.create({
-		create_database: { parent: { type: "page_id", page_id: rootId } },
-		data_source_id: dataSourceId,
-		name,
-		type,
-		...extra,
-	});
-}
-
 async function enrichDraftViews(notion: Client, drafts: DbIds): Promise<void> {
 	await ensureView(notion, drafts.dbId, drafts.dsId, "Approved", "table", {
 		filter: { property: "Status", select: { equals: "approved" } },
@@ -544,12 +422,6 @@ async function enrichDraftViews(notion: Client, drafts: DbIds): Promise<void> {
 		filter: { property: "Status", select: { equals: ["in-review", "needs-revision"] } },
 		sorts: [{ property: "Iteration", direction: "descending" }],
 	});
-	await ensureView(notion, drafts.dbId, drafts.dsId, "Risk review", "table", {
-		sorts: [
-			{ property: "Risk Level", direction: "descending" },
-			{ property: "Iteration", direction: "descending" },
-		],
-	});
 	await ensureView(notion, drafts.dbId, drafts.dsId, "Proof gallery", "gallery", {
 		filter: { property: "Proof", files: { is_not_empty: true } },
 	});
@@ -557,7 +429,7 @@ async function enrichDraftViews(notion: Client, drafts: DbIds): Promise<void> {
 
 async function enrichProjectDashboard(
 	notion: Client,
-	rootId: string,
+	_rootId: string,
 	dbs: {
 		drafts: DbIds;
 		sources: DbIds;
@@ -566,29 +438,7 @@ async function enrichProjectDashboard(
 	},
 ): Promise<void> {
 	try {
-		const scan = await scanRootChildren(notion, rootId);
 		await enrichDraftViews(notion, dbs.drafts);
-		await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_APPROVED_VIEW_TITLE, "table", {
-			filter: { property: "Status", select: { equals: "approved" } },
-			sorts: [{ property: "Approved At", direction: "descending" }],
-		});
-		await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_LATEST_VIEW_TITLE, "table", {
-			sorts: [{ property: "Iteration", direction: "descending" }],
-		});
-		await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_NEEDS_REVIEW_VIEW_TITLE, "table", {
-			filter: { property: "Status", select: { equals: ["in-review", "needs-revision"] } },
-			sorts: [{ property: "Iteration", direction: "descending" }],
-		});
-		await ensureLinkedView(notion, rootId, scan, dbs.openQuestions.dsId, ROOT_OPEN_QUESTIONS_VIEW_TITLE, "table", {
-			filter: { property: "Status", select: { equals: "open" } },
-			sorts: [{ property: "Asked At", direction: "descending" }],
-		});
-		await ensureLinkedView(notion, rootId, scan, dbs.decisions.dsId, ROOT_LATEST_DECISIONS_VIEW_TITLE, "table", {
-			sorts: [{ property: "Made At", direction: "descending" }],
-		});
-		await ensureLinkedView(notion, rootId, scan, dbs.sources.dsId, ROOT_SOURCES_VIEW_TITLE, "table", {
-			sorts: [{ property: "Captured At", direction: "descending" }],
-		});
 	} catch (err) {
 		console.warn("[provision] dashboard/view enrichment skipped:", err);
 	}
@@ -609,7 +459,7 @@ async function createRootPage(
 				title: [{ type: "text", text: { content: `📁 ${briefTitle}` } }],
 			},
 		},
-		children: rootDashboardChildren(category),
+		children: rootDashboardChildren(),
 	});
 	return res.id;
 }
@@ -667,6 +517,51 @@ async function findOrCreateAnswerAnchor(
 	return created.id;
 }
 
+async function findOrCreateStatusHero(
+	notion: Client,
+	rootId: string,
+): Promise<string> {
+	let cursor: string | undefined;
+	do {
+		const res = await notion.blocks.children.list({
+			block_id: rootId,
+			start_cursor: cursor,
+			page_size: 100,
+		});
+		for (const block of res.results) {
+			if (!("type" in block)) continue;
+			if (block.type === "callout") {
+				const emoji =
+					block.callout.icon?.type === "emoji"
+						? block.callout.icon.emoji
+						: null;
+				if (
+					emoji === "🌱" ||
+					emoji === "🌀" ||
+					emoji === "✅" ||
+					emoji === "🔁" ||
+					emoji === "❌"
+				) {
+					return block.id;
+				}
+			}
+		}
+		cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
+	} while (cursor);
+
+	const appended = await notion.blocks.children.append({
+		block_id: rootId,
+		children: [buildStatusHeroBlock({ kind: "provisioning" })],
+	});
+	const created = appended.results[0];
+	if (!created || !("id" in created)) {
+		throw new Error(
+			"provisionProject: failed to create status hero callout on root",
+		);
+	}
+	return created.id;
+}
+
 /**
  * Create (or recover) the per-brief project subtree.
  *
@@ -699,6 +594,13 @@ export async function provisionProject(
 		// but before state is written would orphan the page and trigger a
 		// duplicate root on retry (we have no way to find it by name in a
 		// subtree we never persisted).
+		await writeHivemindState(notion, briefId, state);
+	}
+
+	let statusHeroBlockId = state.statusHeroBlockId;
+	if (!statusHeroBlockId) {
+		statusHeroBlockId = await findOrCreateStatusHero(notion, projectRootId);
+		state = { ...state, statusHeroBlockId };
 		await writeHivemindState(notion, briefId, state);
 	}
 
@@ -811,6 +713,7 @@ export async function provisionProject(
 		planPageId,
 		activityPageId,
 		answerAnchorBlockId,
+		statusHeroBlockId,
 		dsIds: {
 			drafts: draftsIds,
 			sources: sourcesIds,
@@ -834,12 +737,16 @@ export async function provisionProject(
 		},
 	});
 
-	await enrichProjectDashboard(notion, projectRootId, {
-		drafts: draftsIds,
-		sources: sourcesIds,
-		decisions: decisionsIds,
-		openQuestions: openQuestionsIds,
-	});
+	if (!state.dashboardEnriched) {
+		await enrichProjectDashboard(notion, projectRootId, {
+			drafts: draftsIds,
+			sources: sourcesIds,
+			decisions: decisionsIds,
+			openQuestions: openQuestionsIds,
+		});
+		state = { ...state, dashboardEnriched: true };
+		await writeHivemindState(notion, briefId, state);
+	}
 
 	await ensureRunsViews({ notion, runs: runsIds });
 
@@ -851,6 +758,7 @@ export async function provisionProject(
 		planPageId,
 		activityPageId,
 		answerAnchorBlockId,
+		statusHeroBlockId,
 		dbs: {
 			drafts: draftsIds,
 			sources: sourcesIds,

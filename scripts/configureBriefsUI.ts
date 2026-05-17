@@ -30,6 +30,8 @@ import { readHivemindState } from "../src/state";
 
 const LEGACY_STATE_PROP = "Hivemind State";
 const PROJECT_PROP = "📁 Project";
+const VERDICT_PROP = "Verdict";
+const VERDICT_SUMMARY_PROP = "Verdict Summary";
 
 async function main(): Promise<void> {
 	const token = process.env.NOTION_API_TOKEN;
@@ -63,6 +65,36 @@ async function main(): Promise<void> {
 		);
 	} else {
 		console.log(`  = ${PROJECT_PROP} already present, skipping`);
+	}
+
+	if (!props[VERDICT_PROP]) {
+		propertyUpdates[VERDICT_PROP] = {
+			select: {
+				options: [
+					{ name: "approve", color: "green" },
+					{ name: "needs-revision", color: "orange" },
+					{ name: "failed", color: "red" },
+				],
+			},
+		};
+		console.log(`  + adding ${VERDICT_PROP} (select)`);
+	} else if (props[VERDICT_PROP].type !== "select") {
+		console.warn(
+			`  ! ${VERDICT_PROP} exists but is type=${props[VERDICT_PROP].type}, expected select — skipping`,
+		);
+	} else {
+		console.log(`  = ${VERDICT_PROP} already present, skipping`);
+	}
+
+	if (!props[VERDICT_SUMMARY_PROP]) {
+		propertyUpdates[VERDICT_SUMMARY_PROP] = { rich_text: {} };
+		console.log(`  + adding ${VERDICT_SUMMARY_PROP} (rich_text)`);
+	} else if (props[VERDICT_SUMMARY_PROP].type !== "rich_text") {
+		console.warn(
+			`  ! ${VERDICT_SUMMARY_PROP} exists but is type=${props[VERDICT_SUMMARY_PROP].type}, expected rich_text — skipping`,
+		);
+	} else {
+		console.log(`  = ${VERDICT_SUMMARY_PROP} already present, skipping`);
 	}
 
 	if (props[LEGACY_STATE_PROP]) {

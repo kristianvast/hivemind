@@ -39,7 +39,7 @@ export interface AgentContext {
 	notion: import("@notionhq/client").Client;
 	briefId: string;
 	projectRootId: string;
-	agentName: "Architect" | "Scout" | "Librarian" | "Oracle" | "Forge" | "Scribe" | "Sentinel";
+	agentName: "Architect" | "Scout" | "Librarian" | "Oracle" | "Forge" | "Scribe" | "Sentinel" | "Anvil";
 	scopeGuard: {
 		assertAllowed(pageId: string): Promise<unknown>;
 		registerCreated(pageId: string): void;

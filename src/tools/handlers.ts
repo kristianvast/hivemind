@@ -14,6 +14,13 @@ import type {
 } from "@notionhq/client";
 
 import { runAgent, type AgentContext, type ToolDispatcher } from "../agentLoop";
+import {
+	anvilScreenshotUrl,
+	anvilStartServer,
+	anvilUploadImageToNotion,
+	anvilWriteFileToSession,
+	getOrCreateAnvilSession,
+} from "../anvil";
 import { appendAudit } from "../audit";
 import type { TokenBudget } from "../budget";
 import {
@@ -23,6 +30,7 @@ import {
 	type RunAgent,
 } from "../runs";
 import {
+	getAnvilSpec,
 	getLibrarianSpec,
 	getOracleSpec,
 	getScoutSubagentSpec,
@@ -114,11 +122,14 @@ export interface ToolHandlerContext extends AgentContext {
 	scopeGuard: ScopeGuard;
 	pacer: Pacer;
 	tokenBudget: TokenBudget;
-	agentName: "Architect" | "Scout" | "Librarian" | "Oracle" | "Forge" | "Scribe" | "Sentinel";
+	agentName: "Architect" | "Scout" | "Librarian" | "Oracle" | "Forge" | "Scribe" | "Sentinel" | "Anvil";
 	/** Populated by setVerdict; read by orchestrator after agent finishes. */
 	verdict?: { verdict: "approve" | "needs-revision"; summary: string };
 	/** Populated by done(summary); read by parent after sub-agent finishes. */
 	doneSummary?: string;
+	/** Populated by anvilServe; surfaces the live URL back to the parent
+	 * (the Architect) as part of the delegateAnvil return value. */
+	anvilLocalhostUrl?: string;
 }
 
 type BlockShapeType =
@@ -577,6 +588,68 @@ async function listAllBlocks(
 	return all;
 }
 
+interface PlanSectionLocation {
+	headingId: string;
+	lastBlockIdInSection: string;
+	bodyBlockIds: string[];
+}
+
+async function locatePlanSection(
+	ctx: ToolHandlerContext,
+	planPageId: string,
+	section: string,
+): Promise<PlanSectionLocation | null> {
+	const all = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
+	let headingId: string | null = null;
+	let lastBlockIdInSection: string | null = null;
+	const bodyBlockIds: string[] = [];
+	let inSection = false;
+	for (const { id, block } of all) {
+		if (block.type === "heading_2") {
+			const h = block.heading_2 as { rich_text: { plain_text: string }[] };
+			const heading = richTextToPlain(h.rich_text);
+			if (heading === section) {
+				headingId = id;
+				lastBlockIdInSection = id;
+				inSection = true;
+				continue;
+			}
+			if (inSection) break;
+		}
+		if (inSection) {
+			lastBlockIdInSection = id;
+			bodyBlockIds.push(id);
+		}
+	}
+	if (!headingId || !lastBlockIdInSection) return null;
+	return { headingId, lastBlockIdInSection, bodyBlockIds };
+}
+
+async function ensurePlanSection(
+	ctx: ToolHandlerContext,
+	planPageId: string,
+	section: string,
+): Promise<PlanSectionLocation> {
+	const existing = await locatePlanSection(ctx, planPageId, section);
+	if (existing) return existing;
+	await ctx.pacer.acquire();
+	const res = await ctx.notion.blocks.children.append({
+		block_id: planPageId,
+		children: [heading2(section)],
+	});
+	const created = res.results[0];
+	if (!created || !("id" in created)) {
+		throw new Error(
+			`ensurePlanSection: failed to create heading for "${section}"`,
+		);
+	}
+	return {
+		headingId: created.id,
+		lastBlockIdInSection: created.id,
+		bodyBlockIds: [],
+	};
+}
+
 async function appendToPlanSectionHelper(
 	ctx: ToolHandlerContext,
 	planPageId: string,
@@ -584,37 +657,12 @@ async function appendToPlanSectionHelper(
 	blocks: BlockObjectRequest[],
 ): Promise<void> {
 	if (blocks.length === 0) return;
-
-	const all = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
-	let sectionHeadingId: string | null = null;
-	let insertAfterId: string | null = null;
-	let inSection = false;
-	for (const { id, block } of all) {
-		if (block.type === "heading_2") {
-			const h = block.heading_2 as { rich_text: { plain_text: string }[] };
-			const heading = richTextToPlain(h.rich_text);
-			if (heading === section) {
-				sectionHeadingId = id;
-				insertAfterId = id;
-				inSection = true;
-				continue;
-			}
-			if (inSection) break;
-		}
-		if (inSection) insertAfterId = id;
-	}
-
-	if (!sectionHeadingId) {
-		throw new Error(
-			`appendToPlanSection: section "${section}" not found on Plan page`,
-		);
-	}
-
+	const loc = await ensurePlanSection(ctx, planPageId, section);
 	await ctx.pacer.acquire();
 	await ctx.notion.blocks.children.append({
 		block_id: planPageId,
 		children: blocks,
-		after: insertAfterId ?? sectionHeadingId,
+		after: loc.lastBlockIdInSection,
 	});
 }
 
@@ -674,10 +722,6 @@ function stringifyBlock(
 			};
 			return `\`\`\`${c.language ?? ""}\n${richTextToPlain(c.rich_text)}\n\`\`\``;
 		}
-		case "callout": {
-			const c = block.callout as { rich_text: { plain_text: string }[] };
-			return `📢 ${richTextToPlain(c.rich_text)}`;
-		}
 		case "toggle": {
 			const t = block.toggle as { rich_text: { plain_text: string }[] };
 			return `▸ ${richTextToPlain(t.rich_text)}`;
@@ -687,6 +731,32 @@ function stringifyBlock(
 		case "bookmark": {
 			const bm = block.bookmark as { url?: string };
 			return `[bookmark] ${bm.url ?? ""}`;
+		}
+		case "image":
+		case "video":
+		case "audio":
+		case "pdf":
+		case "file": {
+			const m = block[block.type] as {
+				type?: string;
+				file?: { url?: string };
+				external?: { url?: string };
+				file_upload?: { id?: string };
+				caption?: { plain_text: string }[];
+				name?: string;
+			};
+			const cap = (m.caption ?? []).map((r) => r.plain_text).join("").trim();
+			const src = m.file?.url ?? m.external?.url ?? (m.file_upload?.id ? `file_upload:${m.file_upload.id}` : "?");
+			const label = m.name ?? cap;
+			return `[${block.type}${label ? ` "${label}"` : ""}] ${src}`;
+		}
+		case "callout": {
+			const c = block.callout as {
+				rich_text: { plain_text: string }[];
+				icon?: { emoji?: string };
+			};
+			const icon = c.icon?.emoji ?? "📌";
+			return `${icon} ${richTextToPlain(c.rich_text)}`;
 		}
 		default:
 			return null;
@@ -803,20 +873,6 @@ function buildPropertyConfig(
 			return { type: "verification", verification: {} };
 		default:
 			throw new Error(`buildPropertyConfig: unsupported type "${type}"`);
-	}
-}
-
-function outputTypeForCategory(category: string | null): string {
-	switch (category) {
-		case "writing":
-			return "writing";
-		case "visual-engineering":
-			return "design";
-		case "deep":
-		case "ultrabrain":
-			return "analysis";
-		default:
-			return "implementation";
 	}
 }
 
@@ -958,10 +1014,7 @@ const HANDLERS: Record<string, Handler> = {
 				iteration: extractNumber(props.Iteration),
 				status: extractSelect(props.Status),
 				last_verdict: extractSelect(props["Last Verdict"]),
-				risk_level: extractSelect(props["Risk Level"]),
-				quality_score: extractNumber(props["Quality Score"]),
 				review_count: extractNumber(props["Review Count"]),
-				output_type: extractSelect(props["Output Type"]),
 				summary:
 					summary && summary.length > 200
 						? `${summary.slice(0, 200)}…`
@@ -1006,10 +1059,7 @@ const HANDLERS: Record<string, Handler> = {
 			sources: extractURL(page.properties.Sources),
 			author_agent: extractSelect(page.properties["Author Agent"]),
 			last_verdict: extractSelect(page.properties["Last Verdict"]),
-			risk_level: extractSelect(page.properties["Risk Level"]),
-			quality_score: extractNumber(page.properties["Quality Score"]),
 			review_count: extractNumber(page.properties["Review Count"]),
-			output_type: extractSelect(page.properties["Output Type"]),
 			body: blocks
 				.map((b) => stringifyBlock(b.block))
 				.filter((s): s is string => s !== null)
@@ -1061,31 +1111,8 @@ const HANDLERS: Record<string, Handler> = {
 		const planPageId = ctx.projectIds.planPageId;
 		await ctx.scopeGuard.assertAllowed(planPageId);
 
-		const all = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
-		let sectionHeadingId: string | null = null;
-		const toDelete: string[] = [];
-		let inSection = false;
-		for (const { id, block } of all) {
-			if (block.type === "heading_2") {
-				const h = block.heading_2 as { rich_text: { plain_text: string }[] };
-				const heading = richTextToPlain(h.rich_text);
-				if (heading === section) {
-					sectionHeadingId = id;
-					inSection = true;
-					continue;
-				}
-				if (inSection) break;
-			}
-			if (inSection) toDelete.push(id);
-		}
-
-		if (!sectionHeadingId) {
-			throw new Error(
-				`setPlanSection: section "${section}" not found on Plan page`,
-			);
-		}
-
-		for (const blockId of toDelete) {
+		const loc = await ensurePlanSection(ctx, planPageId, section);
+		for (const blockId of loc.bodyBlockIds) {
 			await ctx.pacer.acquire();
 			await ctx.notion.blocks.delete({ block_id: blockId });
 		}
@@ -1095,7 +1122,7 @@ const HANDLERS: Record<string, Handler> = {
 			await ctx.notion.blocks.children.append({
 				block_id: planPageId,
 				children: blockShapesToNotion(newBlocks),
-				after: sectionHeadingId,
+				after: loc.headingId,
 			});
 		}
 
@@ -1109,39 +1136,15 @@ const HANDLERS: Record<string, Handler> = {
 		const planPageId = ctx.projectIds.planPageId;
 		await ctx.scopeGuard.assertAllowed(planPageId);
 
-		const all = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
-		let sectionHeadingId: string | null = null;
-		let insertAfterId: string | null = null;
-		let inSection = false;
-		for (const { id, block } of all) {
-			if (block.type === "heading_2") {
-				const h = block.heading_2 as { rich_text: { plain_text: string }[] };
-				const heading = richTextToPlain(h.rich_text);
-				if (heading === section) {
-					sectionHeadingId = id;
-					insertAfterId = id;
-					inSection = true;
-					continue;
-				}
-				if (inSection) break;
-			}
-			if (inSection) insertAfterId = id;
-		}
+		if (newBlocks.length === 0) return { block_count: 0 };
 
-		if (!sectionHeadingId) {
-			throw new Error(
-				`appendToPlanSection: section "${section}" not found on Plan page`,
-			);
-		}
-
-		if (newBlocks.length > 0) {
-			await ctx.pacer.acquire();
-			await ctx.notion.blocks.children.append({
-				block_id: planPageId,
-				children: blockShapesToNotion(newBlocks),
-				after: insertAfterId ?? sectionHeadingId,
-			});
-		}
+		const loc = await ensurePlanSection(ctx, planPageId, section);
+		await ctx.pacer.acquire();
+		await ctx.notion.blocks.children.append({
+			block_id: planPageId,
+			children: blockShapesToNotion(newBlocks),
+			after: loc.lastBlockIdInSection,
+		});
 
 		return { block_count: newBlocks.length };
 	},
@@ -1263,9 +1266,6 @@ const HANDLERS: Record<string, Handler> = {
 			"Author Agent": { select: { name: author } },
 			Summary: { rich_text: inlineRichText(summary) },
 			"Review Count": { number: 0 },
-			"Output Type": {
-				select: { name: outputTypeForCategory(ctx.briefMetadata.category) },
-			},
 		};
 		if (sources && sources[0]) {
 			properties.Sources = { url: sources[0] };
@@ -1346,19 +1346,9 @@ const HANDLERS: Record<string, Handler> = {
 			const reviewCount = isFullPage(draft)
 				? (extractNumber(draft.properties["Review Count"]) ?? 0) + 1
 				: 1;
-			const qualityScore = verdict === "approve" ? 100 : Math.max(40, 85 - risks.length * 10);
-			const riskLevel = verdict === "approve"
-				? risks.length > 1
-					? "medium"
-					: "low"
-				: risks.length > 2
-					? "high"
-					: "medium";
 			const properties: CreatePageParameters["properties"] = {
 				"Last Verdict": { select: { name: verdict } },
 				"Review Count": { number: reviewCount },
-				"Quality Score": { number: qualityScore },
-				"Risk Level": { select: { name: riskLevel } },
 			};
 			if (verdict === "approve") {
 				properties["Approved At"] = { date: { start: new Date().toISOString() } };
@@ -2094,6 +2084,146 @@ const HANDLERS: Record<string, Handler> = {
 		);
 		return { ok: true };
 	},
+
+	async anvilWriteFile(input, ctx) {
+		const r = asRecord(input);
+		const path = asString(r.path, "path");
+		const content = asString(r.content, "content");
+		const session = await getOrCreateAnvilSession(ctx.briefId);
+		const { absPath, size } = await anvilWriteFileToSession(
+			session,
+			path,
+			content,
+		);
+		return {
+			path,
+			absolute_path: absPath,
+			size_bytes: size,
+			session_root: session.rootDir,
+		};
+	},
+
+	async anvilServe(input, ctx) {
+		const r = asRecord(input);
+		const port = asOptNumber(r.port, "port");
+		const session = await getOrCreateAnvilSession(ctx.briefId);
+		const { url, port: actualPort, reused } = await anvilStartServer(
+			session,
+			port,
+		);
+		ctx.anvilLocalhostUrl = url;
+		return {
+			url,
+			port: actualPort,
+			reused,
+			session_root: session.rootDir,
+		};
+	},
+
+	async anvilScreenshot(input, ctx) {
+		const r = asRecord(input);
+		const url = asString(r.url, "url");
+		const fullPage =
+			typeof r.full_page === "boolean" ? r.full_page : undefined;
+		const width = asOptNumber(r.width, "width");
+		const height = asOptNumber(r.height, "height");
+		const caption = asOptString(r.caption, "caption");
+		const { buffer, width: w, height: h } = await anvilScreenshotUrl(url, {
+			fullPage,
+			width,
+			height,
+		});
+		const fileUploadId = await anvilUploadImageToNotion(ctx.notion, buffer, {
+			filename: caption ? `${caption.slice(0, 32)}.png` : undefined,
+		});
+
+		try {
+			await ctx.pacer.acquire();
+			await ctx.notion.pages.update({
+				page_id: ctx.projectIds.projectRootId,
+				cover: {
+					type: "file_upload",
+					file_upload: { id: fileUploadId },
+				} as never,
+			});
+		} catch (err) {
+			console.warn("[handlers] anvilScreenshot cover update failed:", err);
+		}
+
+		return {
+			file_upload_id: fileUploadId,
+			width: w,
+			height: h,
+			bytes: buffer.length,
+		};
+	},
+
+	async anvilEmbedImage(input, ctx) {
+		const r = asRecord(input);
+		const pageId = asString(r.page_id, "page_id");
+		const fileUploadId = asString(r.file_upload_id, "file_upload_id");
+		const caption = asOptString(r.caption, "caption");
+		await auditIfExternal(ctx, "anvilEmbedImage", pageId);
+		const blocks: BlockObjectRequest[] = [
+			image({ file_upload_id: fileUploadId, caption }),
+		];
+		if (caption) blocks.push(paragraph(caption));
+		await ctx.pacer.acquire();
+		const insertAfter =
+			pageId === ctx.projectIds.projectRootId
+				? ctx.projectIds.statusHeroBlockId
+				: undefined;
+		const res = await ctx.notion.blocks.children.append({
+			block_id: pageId,
+			children: blocks,
+			...(insertAfter ? { after: insertAfter } : {}),
+		});
+		return { ok: true, block_ids: res.results.map((b) => b.id) };
+	},
+
+	async anvilSay(input, ctx) {
+		const r = asRecord(input);
+		const pageId = asString(r.page_id, "page_id");
+		const text = asString(r.text, "text");
+		const emoji = asOptString(r.emoji, "emoji") ?? "⚒️";
+		const color = asOptString(r.color, "color");
+		await auditIfExternal(ctx, "anvilSay", pageId);
+		await ctx.pacer.acquire();
+		const insertAfter =
+			pageId === ctx.projectIds.projectRootId
+				? ctx.projectIds.statusHeroBlockId
+				: undefined;
+		const res = await ctx.notion.blocks.children.append({
+			block_id: pageId,
+			children: [callout(text, emoji, color)],
+			...(insertAfter ? { after: insertAfter } : {}),
+		});
+		return { ok: true, block_ids: res.results.map((b) => b.id) };
+	},
+
+	async delegateAnvil(input, ctx) {
+		const r = asRecord(input);
+		const task = asString(r.task, "task");
+		const context = asOptString(r.context, "context");
+		const spec = getAnvilSpec();
+		const subCtxRef: { url?: string } = {};
+		const result = await runDelegation(
+			ctx,
+			"Anvil",
+			spec,
+			task,
+			context,
+			subCtxRef,
+		);
+		return {
+			summary: result.summary,
+			localhost_url: subCtxRef.url ?? null,
+			tool_calls: result.tool_calls,
+			turns: result.turns,
+			tokens: result.tokens,
+			duration_ms: result.duration_ms,
+		};
+	},
 };
 
 interface DelegationResult {
@@ -2112,6 +2242,7 @@ const SUB_AGENT_EMOJI: Record<AgentName, string> = {
 	Forge: "🔨",
 	Scribe: "✍️",
 	Sentinel: "🛡️",
+	Anvil: "⚒️",
 };
 
 function formatTokensCompact(n: number): string {
@@ -2137,6 +2268,7 @@ async function runDelegation(
 	},
 	query: string,
 	context: string | undefined,
+	sideChannel?: { url?: string },
 ): Promise<DelegationResult> {
 	const subTools = getToolsForAgent(subAgent);
 
@@ -2145,6 +2277,7 @@ async function runDelegation(
 		agentName: subAgent,
 		doneSummary: undefined,
 		verdict: undefined,
+		anvilLocalhostUrl: undefined,
 	};
 
 	const initialUserMessage = context
@@ -2196,6 +2329,9 @@ async function runDelegation(
 			`(${subAgent} returned no summary — see Sources for findings)`;
 		const tokensDelta = parentCtx.tokenBudget.usage - tokensBefore;
 		const durationMs = Date.now() - tStart;
+		if (sideChannel && subCtx.anvilLocalhostUrl) {
+			sideChannel.url = subCtx.anvilLocalhostUrl;
+		}
 
 		if (runIds) {
 			await finishRun({
@@ -2259,7 +2395,9 @@ async function logSubDelegation(
 	const activityPageId = parentCtx.projectIds.activityPageId;
 	if (!activityPageId) return;
 	const emoji = SUB_AGENT_EMOJI[args.subAgent] ?? "•";
-	const headline = `${emoji} ${args.subAgent} → "${args.query.slice(0, 80)}${args.query.length > 80 ? "…" : ""}" · ${args.toolCalls} tools · ${formatDurationCompact(args.durationMs)} · ${formatTokensCompact(args.tokens)} tokens`;
+	const trimmed =
+		args.query.length > 80 ? `${args.query.slice(0, 80)}…` : args.query;
+	const headline = `${emoji} ${args.subAgent} → "${trimmed}" · ${formatDurationCompact(args.durationMs)} · ${args.toolCalls} tools · ${formatTokensCompact(args.tokens)} tokens`;
 	const children: BlockObjectRequest[] = [paragraph(args.summary)];
 	try {
 		await parentCtx.pacer.acquire();

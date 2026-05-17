@@ -14,7 +14,7 @@ export interface BriefContext {
 	status: string | null;
 }
 
-function titleFromPage(page: PageObjectResponse): string {
+export function titleFromPage(page: PageObjectResponse): string {
 	for (const value of Object.values(page.properties)) {
 		if (value.type === "title") {
 			return value.title.map((rt) => rt.plain_text).join("");
@@ -23,11 +23,17 @@ function titleFromPage(page: PageObjectResponse): string {
 	return "";
 }
 
-function statusFromPage(page: PageObjectResponse): string | null {
+export function statusFromPage(page: PageObjectResponse): string | null {
 	const prop = page.properties.Status;
 	if (prop?.type === "select") return prop.select?.name ?? null;
 	if (prop?.type === "status") return prop.status?.name ?? null;
 	return null;
+}
+
+export function ownerFromPage(page: PageObjectResponse): string | null {
+	const prop = page.properties.Owner;
+	if (prop?.type !== "select") return null;
+	return prop.select?.name ?? null;
 }
 
 async function readPageBody(notion: Client, pageId: string): Promise<string> {
@@ -229,15 +235,34 @@ export type BriefOwner =
 	| "Scribe"
 	| "Sentinel";
 
+export type BriefVerdict = "approve" | "needs-revision" | "failed";
+
+type BriefPropertyValue =
+	| { select: { name: string } | null }
+	| { rich_text: { type: "text"; text: { content: string } }[] };
+
+function buildRichText(
+	text: string,
+): { type: "text"; text: { content: string } }[] {
+	if (text.length === 0) return [];
+	const MAX = 1900;
+	if (text.length <= MAX) {
+		return [{ type: "text", text: { content: text } }];
+	}
+	return [{ type: "text", text: { content: `${text.slice(0, MAX - 1)}…` } }];
+}
+
 export async function setBriefProperties(
 	notion: Client,
 	pageId: string,
-	patch: { status?: BriefStatus; owner?: BriefOwner | null },
+	patch: {
+		status?: BriefStatus;
+		owner?: BriefOwner | null;
+		verdict?: BriefVerdict | null;
+		verdictSummary?: string | null;
+	},
 ): Promise<void> {
-	const properties: Record<
-		string,
-		{ select: { name: string } | null } | { select: { name: string } }
-	> = {};
+	const properties: Record<string, BriefPropertyValue> = {};
 	if (patch.status !== undefined) {
 		properties.Status = { select: { name: patch.status } };
 	}
@@ -245,8 +270,38 @@ export async function setBriefProperties(
 		properties.Owner =
 			patch.owner === null ? { select: null } : { select: { name: patch.owner } };
 	}
+	if (patch.verdict !== undefined) {
+		properties.Verdict =
+			patch.verdict === null
+				? { select: null }
+				: { select: { name: patch.verdict } };
+	}
+	if (patch.verdictSummary !== undefined) {
+		properties["Verdict Summary"] = {
+			rich_text:
+				patch.verdictSummary === null
+					? []
+					: buildRichText(patch.verdictSummary),
+		};
+	}
 	if (Object.keys(properties).length === 0) return;
-	await notion.pages.update({ page_id: pageId, properties });
+
+	const optionalKeys = ["Verdict", "Verdict Summary"];
+	try {
+		await notion.pages.update({ page_id: pageId, properties });
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		const missingOptional = optionalKeys.filter(
+			(k) => msg.includes(k) && msg.includes("does not exist"),
+		);
+		if (missingOptional.length === 0) throw err;
+		console.warn(
+			`[notion] Briefs DB missing ${missingOptional.join(", ")} — run scripts/configureBriefsUI.ts to add. Retrying without.`,
+		);
+		for (const k of missingOptional) delete properties[k];
+		if (Object.keys(properties).length === 0) return;
+		await notion.pages.update({ page_id: pageId, properties });
+	}
 }
 
 export async function appendBlocks(
@@ -686,7 +741,11 @@ export async function reportChainFailure(
 	const trace = [stage, message, stack].filter((s) => s.length > 0).join("\n");
 
 	try {
-		await setBriefProperties(notion, pageId, { status: "Failed" });
+		await setBriefProperties(notion, pageId, {
+			status: "Failed",
+			verdict: "failed",
+			verdictSummary: `Failed at ${stage}: ${message}`,
+		});
 	} catch (e) {
 		// Swallow — we still want to post the comment with the original error.
 		console.warn("[reportChainFailure] failed to set Status=Failed:", e);

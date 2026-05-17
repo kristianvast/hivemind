@@ -9,7 +9,8 @@ export type AgentName =
 	| "Oracle"
 	| "Forge"
 	| "Scribe"
-	| "Sentinel";
+	| "Sentinel"
+	| "Anvil";
 
 // ---------------------------------------------------------------------------
 // Shared sub-schemas
@@ -351,7 +352,7 @@ export const ALL_TOOLS: Record<string, Anthropic.Tool> = {
 	writeAnswer: {
 		name: "writeAnswer",
 		description:
-			"Write the answer directly onto the project root page (for `writing` and `quick` categories — no Drafts DB exists). The body is converted from markdown to Notion blocks and inserted between the `📄 Answer` anchor heading and the Plan/Activity navigation child pages. On re-run (revision cycle), any prior content in that region is replaced. Use this as the single output for these categories — there is no createDraft. Returns { written: true, block_count }.",
+			"Write a prose answer directly onto the project root page. The `body` markdown is converted to Notion blocks (headings, lists, code fences, paragraphs) and inserted between the `📄 Answer` anchor heading and the Plan/Drafts/Activity navigation child pages. On re-run, any prior content in that region is replaced. Use for one-shot prose answers. For richer artifacts (callouts, toggles, tables, images, linked databases) call `createChildPage` with a `blocks` array AND/OR `manageView`/`manageDatabase`/`uploadFile` — `writeAnswer` is markdown only. Returns { written: true, block_count }.",
 		input_schema: {
 			type: "object" as const,
 			properties: {
@@ -679,6 +680,159 @@ export const ALL_TOOLS: Record<string, Anthropic.Tool> = {
 				},
 			},
 			required: ["question"],
+			additionalProperties: false,
+		},
+	},
+
+	delegateAnvil: {
+		name: "delegateAnvil",
+		description:
+			"Spawn an Anvil sub-agent to LOCALLY EXECUTE something — write files, spin up a localhost HTTP server, drive a headless browser, capture screenshots, and embed the proof in the brief subtree. Use when the brief asks to BUILD or DEMO something that benefits from being seen running (a website, a landing page, a UI mockup, an interactive prototype). Anvil writes proof (screenshot + live localhost URL) into the project root via its own tool calls. Anvil runs ONLY in --local orchestrator mode (the deployed Worker has no filesystem / Playwright). Returns { summary, localhost_url, tool_calls, tokens, duration_ms }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				task: {
+					type: "string",
+					description:
+						"The build-and-demonstrate task for Anvil. Be concrete about what to build and what to show — e.g. 'Build a one-page coffee-shop landing site with hero, menu, and contact, then screenshot the hero section'.",
+				},
+				context: {
+					type: "string",
+					description:
+						"Optional 1-3 sentence context: visual style, color palette, key content, constraints. Anvil works best when given concrete content to render.",
+				},
+			},
+			required: ["task"],
+			additionalProperties: false,
+		},
+	},
+
+	anvilWriteFile: {
+		name: "anvilWriteFile",
+		description:
+			"(Anvil only) Write a text file into the Anvil session's temp directory. Use this to create HTML, CSS, and JS files for the local demo site. Paths are relative to the session root — no leading '/' or '..'. Returns { path, size_bytes }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				path: {
+					type: "string",
+					description:
+						"Relative path within the session root (e.g. 'index.html', 'styles/main.css', 'js/app.js'). Parent directories are created automatically.",
+				},
+				content: {
+					type: "string",
+					description: "Full text content of the file. UTF-8.",
+				},
+			},
+			required: ["path", "content"],
+			additionalProperties: false,
+		},
+	},
+
+	anvilServe: {
+		name: "anvilServe",
+		description:
+			"(Anvil only) Start a static HTTP server on 127.0.0.1 serving the Anvil session's files. Idempotent — returns the existing URL if already started. The server stays alive after the agent finishes so a human can visit the URL. Returns { url, port, reused }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				port: {
+					type: "number",
+					description:
+						"Optional preferred port. Omit to let the kernel pick a free port (recommended).",
+				},
+			},
+			required: [],
+			additionalProperties: false,
+		},
+	},
+
+	anvilScreenshot: {
+		name: "anvilScreenshot",
+		description:
+			"(Anvil only) Use headless Chromium (Playwright) to navigate to a URL and capture a PNG screenshot. The screenshot is uploaded to Notion as a file_upload and the returned id can be passed to anvilEmbedImage or to an image block in appendBlocks. Returns { file_upload_id, width, height, bytes }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				url: {
+					type: "string",
+					description:
+						"URL to screenshot. Usually the localhost URL returned by anvilServe.",
+				},
+				full_page: {
+					type: "boolean",
+					description: "Capture the full scrolling page instead of just the viewport. Default false.",
+				},
+				width: {
+					type: "number",
+					description: "Viewport width in pixels (default 1280).",
+				},
+				height: {
+					type: "number",
+					description: "Viewport height in pixels (default 800).",
+				},
+				caption: {
+					type: "string",
+					description: "Optional caption stored on the Notion upload (used as filename hint).",
+				},
+			},
+			required: ["url"],
+			additionalProperties: false,
+		},
+	},
+
+	anvilEmbedImage: {
+		name: "anvilEmbedImage",
+		description:
+			"(Anvil only) Append a Notion image block (by file_upload_id) plus optional caption paragraph to a page in the brief subtree. Use right after anvilScreenshot to drop the rendered proof into the project root or a child page. Returns { ok, block_ids }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				page_id: {
+					type: "string",
+					description:
+						"Page to append the image to. Usually the project root id (call getProjectIds first).",
+				},
+				file_upload_id: {
+					type: "string",
+					description: "The file_upload_id returned by anvilScreenshot.",
+				},
+				caption: {
+					type: "string",
+					description: "Optional caption rendered under the image as a paragraph.",
+				},
+			},
+			required: ["page_id", "file_upload_id"],
+			additionalProperties: false,
+		},
+	},
+
+	anvilSay: {
+		name: "anvilSay",
+		description:
+			"(Anvil only) Append a callout block to a page in the brief subtree to surface a key fact or the live localhost URL. Use this to make the localhost URL conspicuous in Notion (e.g. '🌐 Live demo: http://localhost:54321'). Returns { ok, block_ids }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				page_id: {
+					type: "string",
+					description: "Page id to append the callout to.",
+				},
+				text: {
+					type: "string",
+					description: "Body of the callout.",
+				},
+				emoji: {
+					type: "string",
+					description: "Optional leading emoji (default ⚒️).",
+				},
+				color: {
+					type: "string",
+					description:
+						"Optional callout color (e.g. 'blue_background', 'green_background', 'orange_background').",
+				},
+			},
+			required: ["page_id", "text"],
 			additionalProperties: false,
 		},
 	},
@@ -1044,6 +1198,8 @@ const ARCHITECT_TOOLS = [
 	"readPlanSection",
 	"setPlanSection",
 	"appendToPlanSection",
+	"createChildPage",
+	"appendBlocks",
 	"writeAnswer",
 	"listDrafts",
 	"getDraft",
@@ -1057,6 +1213,7 @@ const ARCHITECT_TOOLS = [
 	"delegateScout",
 	"delegateLibrarian",
 	"delegateOracle",
+	"delegateAnvil",
 	"getWorkspaceHome",
 	"readPageMarkdown",
 	"writePageMarkdown",
@@ -1120,6 +1277,21 @@ const SENTINEL_TOOLS = [
 	"done",
 ] as const;
 
+const ANVIL_TOOLS = [
+	"getBriefMetadata",
+	"getProjectIds",
+	"readPage",
+	"anvilWriteFile",
+	"anvilServe",
+	"anvilScreenshot",
+	"anvilEmbedImage",
+	"anvilSay",
+	"appendBlocks",
+	"createChildPage",
+	"addComment",
+	"done",
+] as const;
+
 export function getToolNamesForAgent(agent: AgentName): readonly string[] {
 	switch (agent) {
 		case "Architect":
@@ -1139,6 +1311,8 @@ export function getToolNamesForAgent(agent: AgentName): readonly string[] {
 			return ARCHITECT_TOOLS;
 		case "Sentinel":
 			return SENTINEL_TOOLS;
+		case "Anvil":
+			return ANVIL_TOOLS;
 	}
 }
 

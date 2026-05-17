@@ -6,5 +6,7 @@ node_modules/
 workers.*.json
 workers.json
 
-# Opencode session state
-.sisyphus/
+# Opencode session state — keep plans/archive tracked (referenced by AGENTS.md)
+.sisyphus/*
+!.sisyphus/plans/
+!.sisyphus/archive/

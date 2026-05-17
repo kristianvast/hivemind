@@ -55,6 +55,17 @@ export interface HivemindState {
 	// it lands above the Plan/Activity navigation child_page blocks. Absent
 	// for categories that use the Drafts DB path. See provision.ts.
 	answerAnchorBlockId?: string;
+	// ID of the live status hero callout at the top of the project root.
+	// Updated in place by the orchestrator at each stage boundary
+	// (Architect start/end, Sentinel start/end, approval, error) so the
+	// user always sees current chain state at a glance. See statusHero.ts
+	// and provision.ts. Absent on briefs provisioned before Phase 7 — the
+	// next provisionProject call backfills it.
+	statusHeroBlockId?: string;
+	// ISO8601 timestamp of when the current chain started (first agent
+	// invocation after provision). Used to compute total chain duration
+	// for the approved status hero. Reset on each new run.
+	chainStartedAt?: string;
 	// Drafts is omitted for "writing"/"quick" briefs; those answers live on the
 	// project root. Sources/Decisions/Open Questions are lightweight evidence
 	// databases for every brief that has a Plan page. Activity remains a
@@ -68,6 +79,22 @@ export interface HivemindState {
 	};
 	tokensUsed?: number;
 	budgetCircuitTripped?: boolean;
+	// Set true after `enrichProjectDashboard` has successfully created the
+	// 6 root-level linked-database views. Prevents re-running on every
+	// provision call (which would create duplicate wrappers — Notion's
+	// views.create with create_database mode leaves the wrapper child
+	// database block with title="" and our title-based idempotency check
+	// in scanRootChildren can't see past the empty title).
+	dashboardEnriched?: boolean;
+	storm?: {
+		firstTrippedAt: string;
+		lastSeenAt: string;
+		suppressedUntil: string;
+		windowMs: number;
+		threshold: number;
+		trips: number;
+		lastDeliveryId?: string;
+	};
 }
 
 // Used to find the state toggle on the brief page. The "do not edit" suffix is
