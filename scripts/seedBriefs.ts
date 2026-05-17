@@ -22,7 +22,7 @@
 //   # or, if you prefer Node + tsx:
 //   npx tsx --env-file=.env scripts/seedBriefs.ts <parent-page-url-or-id>
 
-const NOTION_VERSION = "2022-06-28";
+const NOTION_VERSION = "2025-09-03";
 const NOTION_API_URL = "https://api.notion.com/v1/databases";
 
 type NotionColor =
@@ -58,6 +58,14 @@ const OWNER_OPTIONS: SelectOption[] = [
 	{ name: "Forge", color: "orange" },
 	{ name: "Scribe", color: "purple" },
 	{ name: "Sentinel", color: "red" },
+];
+
+const CATEGORY_OPTIONS: SelectOption[] = [
+	{ name: "visual-engineering", color: "blue" },
+	{ name: "ultrabrain", color: "purple" },
+	{ name: "deep", color: "orange" },
+	{ name: "quick", color: "gray" },
+	{ name: "writing", color: "pink" },
 ];
 
 function extractPageId(input: string): string {
@@ -100,6 +108,43 @@ async function main(): Promise<void> {
 	const parentPageId = extractPageId(arg);
 	console.log(`Parent page ID: ${parentPageId}`);
 
+	// Check if Briefs DB already exists under the parent page
+	const checkRes = await fetch(
+		`https://api.notion.com/v1/blocks/${parentPageId}/children?page_size=100`,
+		{
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Notion-Version": NOTION_VERSION,
+			},
+		},
+	);
+
+	const checkJson = (await checkRes.json()) as Record<string, unknown>;
+	const results = Array.isArray(checkJson.results) ? checkJson.results : [];
+
+	for (const block of results) {
+		const blockObj = block as Record<string, unknown>;
+		if (
+			blockObj.type === "child_database" &&
+			typeof blockObj.child_database === "object" &&
+			blockObj.child_database !== null
+		) {
+			const childDb = blockObj.child_database as Record<string, unknown>;
+			if (childDb.title === "Hivemind Briefs") {
+				const existingId = typeof blockObj.id === "string" ? blockObj.id : undefined;
+				console.log(`✅ Briefs DB already exists: ${existingId}`);
+				console.log("\nNext steps:");
+				console.log("  1. Resolve the data source ID:");
+				console.log(`     ntn datasources resolve ${existingId ?? "<db-id>"}`);
+				console.log("");
+				console.log("  2. Update .env with the IDs:");
+				console.log(`     HIVEMIND_BRIEFS_DATABASE_ID=${existingId ?? "<db-id>"}`);
+				console.log(`     HIVEMIND_BRIEFS_DATA_SOURCE_ID=<data-source-id>`);
+				process.exit(0);
+			}
+		}
+	}
+
 	const body = {
 		parent: { type: "page_id" as const, page_id: parentPageId },
 		title: [
@@ -108,10 +153,19 @@ async function main(): Promise<void> {
 				text: { content: "Hivemind Briefs" },
 			},
 		],
-		properties: {
-			Name: { title: {} },
-			Status: { select: { options: STATUS_OPTIONS } },
-			Owner: { select: { options: OWNER_OPTIONS } },
+		initial_data_source: {
+			properties: {
+				Name: { title: {} },
+				Status: { select: { options: STATUS_OPTIONS } },
+				Owner: { select: { options: OWNER_OPTIONS } },
+				Category: { select: { options: CATEGORY_OPTIONS } },
+				"📁 Project": { url: {} },
+				"Hivemind State": {
+					rich_text: {},
+					description:
+						"🔒 Internal Hivemind orchestrator state. Managed by the worker — do not edit.",
+				},
+			},
 		},
 	};
 
@@ -156,9 +210,14 @@ async function main(): Promise<void> {
 	console.log("  3. Push to the deployed worker:");
 	console.log("     ntn workers env push --yes");
 	console.log("");
-	console.log("  4. In Notion, on the new DB:");
+	console.log("  4. Hide internal state from the UI:");
+	console.log("     bun run scripts/configureBriefsUI.ts");
+	console.log("");
+	console.log("  5. In Notion, on the new DB:");
 	console.log("     - Add a Kanban view grouped by Status");
 	console.log("     - Create one test brief in 'Backlog'");
+	console.log("     - Category is auto-populated by the classifier");
+	console.log("     - 📁 Project URL is auto-populated after the chain provisions the subtree");
 	console.log(
 		"     - Wire DB automation: When Status changes → Send webhook → paste the onBriefStatusChange URL",
 	);
