@@ -2,10 +2,67 @@
 
 ## Project Structure & Module Organization
 - `src/index.ts` defines the worker and capabilities.
+- `anvil/` is the local-executor daemon — runs on the user's Mac, drives a Linux VM + Playwright browser + GitHub remote for `Owner=Forge-Local` briefs. Has its own `package.json` / `tsconfig.json` / `dist/`. The Worker (root) and Anvil (`anvil/`) share no code; they communicate over Pusher Channels. See [`anvil/README.md`](anvil/README.md).
 - `.examples/` has focused samples (sync, tool, automation, OAuth, webhook).
 - Shared agent skills live in `.agents/skills/`. `.claude/skills` is kept as a compatibility symlink for Claude-specific discovery.
 - Generated: `dist/` build output, `workers.json` CLI config.
 - `opencode.json` wires up project-level MCP servers and other opencode settings.
+- Historical plans live under `.sisyphus/plans/` (active) and `.sisyphus/archive/` (superseded).
+
+## Hivemind v1 Architecture (project-specific)
+
+This worker is the Hivemind multi-agent orchestrator. Briefs (Notion DB rows) trigger a chain of Claude tool-use agents that populate a per-brief Notion project subtree.
+
+- **Status state machine** lives in `src/chain.ts`. Webhook in `src/index.ts` routes by Status.
+- **Project subtree** provisioned in `src/provision.ts`. Layout per brief:
+  - `📁 {briefTitle}` (root page)
+  - `Plan` (page — Context / Approach / Decisions / Sources / Open Questions / Status)
+  - `Drafts` (the only database — iteration history; reviews are appended inline on each draft page)
+  - `Activity` (page — chronological agent run log)
+- **Agent execution** is in `src/agentLoop.ts` (hand-rolled Anthropic tool-use loop, step budget = tool calls).
+- **Tools** live in `src/tools/`: `registry.ts` (schemas), `handlers.ts` (dispatch + scope guard). `createSource` / `createDecision` / `createOpenQuestion` append blocks to the matching Plan section; `createReview` appends a Review section to the draft page it reviews.
+- **Scope rule**: agent writes MUST be inside the project subtree (`src/scope.ts` enforces).
+- **Notion API**: always use `data_source_id` for relations, page creates under DBs, and queries (not `database_id`). SDK default version is 2025-09-03.
+
+See `.sisyphus/plans/hivemind-omo-orchestrator.md` for the full v1 plan.
+
+## Hivemind v2 — Anvil (local executor)
+
+Anvil extends Hivemind with a **local daemon** that runs on the user's Mac. It gives the orchestrator full-tool capabilities (real shell, filesystem, Playwright browser, GitHub remote) without breaking the Worker's sandbox.
+
+- **Trigger**: admin sets `Owner = Forge-Local`, `Status = Triaged | Provisioned` on a brief.
+- **Routing** (`src/index.ts` → `pusherPublish`): the existing `onBriefStatusChange` webhook publishes `{ briefId }` to Pusher channel `anvil-dispatch` (event `brief.dispatched`) when those conditions hit.
+- **Receive** (`anvil/src/pusher-subscriber.ts`): Anvil holds an outbound WebSocket to Pusher on the user's machine. No inbound network on the host.
+- **Dispatch** (`anvil/src/main.ts → dispatchBrief`): claim brief via `Owner=Forge-Local-Busy` → spawn VM via `anvil/src/vm-runtime.ts` (Lima default, E2B opt-in) → prepare repo (scaffold new or clone existing via `anvil/src/github.ts`) → start dev server in VM on port 3000 → spawn host-side Playwright MCP → run **Forge-Local** agent loop.
+- **Forge-Local** (`anvil/src/forge-local.ts`, `tools.ts`): Claude tool-use loop with Anthropic native `bash_20250124` + `text_editor_20250728` plus custom `playwright_*` + `git_commit_push` + `report_proof` (terminal). 40-step budget. All bash + file ops run inside the VM, NOT on the host.
+- **Proof** (`anvil/src/proof.ts`): host-side screenshot via Playwright MCP → uploaded to Notion via `notion.fileUploads` → appended as Proof block group to the brief's project subtree → `Status=Done`, `Owner=Forge-Local`, `Repo` + `PR URL` set.
+- **Recovery** (`anvil/src/brief.ts → findStaleBusyBriefs`): on daemon start, briefs stuck `Owner=Forge-Local-Busy` for > 30 min revert to `Triaged`.
+- **Crucial**: the Worker's sandbox constraints (no shell, no subprocess, no npm at runtime) apply **only to `src/`**. Anvil intentionally has all of those — running on the user's machine is the entire point. Anvil's safety boundary is the VM, not the runtime.
+
+See [`anvil/README.md`](anvil/README.md) for install, CLI, verification runbook, and the `lima` vs `e2b` driver choice (`SANDBOX_DRIVER` env var, default `lima`).
+
+Locked plan: `.sisyphus/plans/local-executor.md`.
+
+## Worker Capabilities
+
+Capabilities currently registered in `src/index.ts`:
+
+- `notionWhoAmI` (tool) - smoke test: returns the bot user identity
+- `pingClaude` (tool) - smoke test: sends a prompt to Claude and returns the response
+- `classifyBrief` (tool) - admin: classify a brief title+body via Haiku, returns Category
+- `provisionProject` (tool) - admin: idempotently provision the project subtree for a brief
+- `debugState` (tool) - admin: read and pretty-print the Hivemind State JSON for a brief
+- `onBriefStatusChange` (webhook) - chain trigger: fires when a brief's Status property changes. Routes by Status (`Triaged` → in-Worker agent chain; `Done` → `handleBriefApproved`) **and** by Owner: when `Owner=Forge-Local` and Status is in `{Triaged, Provisioned}`, publishes `{ briefId }` to Pusher channel `anvil-dispatch` so the local Anvil daemon can pick it up. Pusher publish is best-effort: if `PUSHER_APP_ID/KEY/SECRET/CLUSTER` aren't configured the publish is logged and skipped, the webhook still 200s.
+
+### Rate-limit hygiene for `onBriefStatusChange`
+
+The webhook is a **per-capability rate-limited** resource on the Workers platform. A burst of deliveries can blow the budget and lock the capability out for ~30 minutes (visible as runs with empty logs + exit code 1 + ~50 ms duration). Three things keep volume sane — change one without the others and the budget will get tight again:
+
+1. **Worker filters bot-authored edits.** `onBriefStatusChange` checks `page.last_edited_by.id` against `HIVEMIND_BOT_USER_ID` (env var) and short-circuits when they match. This is essential because the chain itself writes `Status=In Progress` once per agent (3-4 writes per chain) — without the filter, each write loops back through the webhook. Keep `HIVEMIND_BOT_USER_ID` set in `.env` (and pushed via `ntn workers env push`) or the filter degrades to a no-op.
+2. **Worker coalesces rapid retriggers.** `acquireChainLock` skips deliveries that arrive within `CHAIN_COALESCE_MS` (10 s) of the previous chain start. This absorbs Notion automation retry storms without affecting legitimate human-paced retries (Triaged → Needs Review → Triaged), which always happen on a > 10 s timescale.
+3. **Notion automation must filter on the right transitions.** In the Briefs database, edit the automation that fires this webhook and set its trigger condition to `Status` is `Triaged` OR `Status` is `Done` (and `Owner` is `Forge-Local` for the Anvil dispatch path). The default "any property change" trigger fires on every column edit and is the single biggest source of wasted deliveries. There is no code-side fallback for this — the Worker has to receive the delivery before it can early-return, and the early-return still costs a rate-limit slot.
+
+If a brief is stuck in Triaged and the chain is not advancing, check `ntn workers runs list --plain | head -n 20` for a wall of exit-1 / empty-log runs. That is the rate-limit signature. Either wait for the window to drain (run `ntn workers exec debugState -d '{"briefId":"…"}'` and read the `Retry after N seconds` in the 429), or redeploy with `ntn workers deploy` to reset the window.
 
 ## Documentation Lookup (Notion Docs MCP)
 
