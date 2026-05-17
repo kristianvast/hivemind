@@ -576,6 +576,18 @@ function requirePlanPageId(ctx: ToolHandlerContext, toolName: string): string {
 	return id;
 }
 
+function optionalSourcesDsId(ctx: ToolHandlerContext): string | undefined {
+	return ctx.projectIds.dbs.sources?.dsId;
+}
+
+function optionalDecisionsDsId(ctx: ToolHandlerContext): string | undefined {
+	return ctx.projectIds.dbs.decisions?.dsId;
+}
+
+function optionalOpenQuestionsDsId(ctx: ToolHandlerContext): string | undefined {
+	return ctx.projectIds.dbs.openQuestions?.dsId;
+}
+
 function outputTypeForCategory(category: string | null): string {
 	switch (category) {
 		case "writing":
@@ -1168,13 +1180,30 @@ const HANDLERS: Record<string, Handler> = {
 
 		const planPageId = requirePlanPageId(ctx, "createSource");
 		await ctx.scopeGuard.assertAllowed(planPageId);
+		const dsId = optionalSourcesDsId(ctx);
+		let sourceId: string | undefined;
+		if (dsId) {
+			await ctx.pacer.acquire();
+			const page = await ctx.notion.pages.create({
+				parent: { type: "data_source_id", data_source_id: dsId },
+				properties: {
+					Name: { title: [{ type: "text", text: { content: title } }] },
+					URL: { url },
+					Summary: { rich_text: summary ? inlineRichText(summary) : [] },
+					"Captured By": { select: { name: ctx.agentName } },
+					"Captured At": { date: { start: new Date().toISOString() } },
+				},
+			});
+			sourceId = page.id;
+			ctx.scopeGuard.registerCreated(page.id);
+		}
 
 		const tail = summary ? ` — ${summary}` : "";
 		const blocks: BlockObjectRequest[] = [
 			bullet(`${title} (${url})${tail}  · captured by ${ctx.agentName}`),
 		];
 		await appendToPlanSectionHelper(ctx, planPageId, "Sources", blocks);
-		return { ok: true };
+		return { ok: true, source_id: sourceId };
 	},
 
 	async createDecision(input, ctx) {
@@ -1189,6 +1218,26 @@ const HANDLERS: Record<string, Handler> = {
 
 		const planPageId = requirePlanPageId(ctx, "createDecision");
 		await ctx.scopeGuard.assertAllowed(planPageId);
+		const dsId = optionalDecisionsDsId(ctx);
+		let decisionId: string | undefined;
+		if (dsId) {
+			await ctx.pacer.acquire();
+			const page = await ctx.notion.pages.create({
+				parent: { type: "data_source_id", data_source_id: dsId },
+				properties: {
+					Name: { title: [{ type: "text", text: { content: title } }] },
+					Choice: { rich_text: inlineRichText(choice) },
+					Rationale: { rich_text: inlineRichText(rationale) },
+					"Alternatives Considered": {
+						rich_text: alternatives ? inlineRichText(alternatives.join("\n")) : [],
+					},
+					"Made By": { select: { name: ctx.agentName } },
+					"Made At": { date: { start: new Date().toISOString() } },
+				},
+			});
+			decisionId = page.id;
+			ctx.scopeGuard.registerCreated(page.id);
+		}
 
 		const blocks: BlockObjectRequest[] = [
 			heading3(`${title} — ${ctx.agentName}, ${new Date().toISOString()}`),
@@ -1200,7 +1249,7 @@ const HANDLERS: Record<string, Handler> = {
 			for (const a of alternatives) blocks.push(bullet(a));
 		}
 		await appendToPlanSectionHelper(ctx, planPageId, "Decisions", blocks);
-		return { ok: true };
+		return { ok: true, decision_id: decisionId };
 	},
 
 	async createOpenQuestion(input, ctx) {
@@ -1210,13 +1259,32 @@ const HANDLERS: Record<string, Handler> = {
 
 		const planPageId = requirePlanPageId(ctx, "createOpenQuestion");
 		await ctx.scopeGuard.assertAllowed(planPageId);
+		const dsId = optionalOpenQuestionsDsId(ctx);
+		let questionId: string | undefined;
+		if (dsId) {
+			await ctx.pacer.acquire();
+			const page = await ctx.notion.pages.create({
+				parent: { type: "data_source_id", data_source_id: dsId },
+				properties: {
+					Name: { title: [{ type: "text", text: { content: question } }] },
+					"Why It Matters": {
+						rich_text: whyItMatters ? inlineRichText(whyItMatters) : [],
+					},
+					Status: { select: { name: "open" } },
+					"Asked By": { select: { name: ctx.agentName } },
+					"Asked At": { date: { start: new Date().toISOString() } },
+				},
+			});
+			questionId = page.id;
+			ctx.scopeGuard.registerCreated(page.id);
+		}
 
 		const tail = whyItMatters ? ` — ${whyItMatters}` : "";
 		const blocks: BlockObjectRequest[] = [
 			bullet(`${question}${tail}  · asked by ${ctx.agentName}`),
 		];
 		await appendToPlanSectionHelper(ctx, planPageId, "Open Questions", blocks);
-		return { ok: true };
+		return { ok: true, question_id: questionId };
 	},
 
 	async addComment(input, ctx) {

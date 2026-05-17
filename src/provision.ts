@@ -446,16 +446,18 @@ async function findOrCreateProjectDatabase(
 	return createProjectDatabase(notion, rootId, title, properties);
 }
 
-type NotionWithViews = {
-	views?: {
-		list(args: { database_id?: string; data_source_id?: string }): Promise<{ results: { id: string }[] }>;
-		retrieve(args: { view_id: string }): Promise<{ id: string; name?: string }>;
-		create(args: Record<string, unknown>): Promise<unknown>;
-	};
-};
+interface NotionViews {
+	list(args: { database_id?: string; data_source_id?: string }): Promise<{ results: { id: string }[] }>;
+	retrieve(args: { view_id: string }): Promise<{ id: string; name?: string }>;
+	create(args: Record<string, unknown>): Promise<unknown>;
+}
+
+function notionViews(notion: Client): NotionViews | undefined {
+	return (notion as unknown as { views?: NotionViews }).views;
+}
 
 async function viewNames(notion: Client, dbId: string): Promise<Set<string>> {
-	const views = (notion as unknown as NotionWithViews).views;
+	const views = notionViews(notion);
 	if (!views) return new Set();
 	const listed = await views.list({ database_id: dbId });
 	const names = new Set<string>();
@@ -474,7 +476,7 @@ async function ensureView(
 	type: string,
 	extra: Record<string, unknown> = {},
 ): Promise<void> {
-	const views = (notion as unknown as NotionWithViews).views;
+	const views = notionViews(notion);
 	if (!views) return;
 	const existing = await viewNames(notion, databaseId);
 	if (existing.has(name)) return;
@@ -496,7 +498,7 @@ async function ensureLinkedView(
 	type: string,
 	extra: Record<string, unknown> = {},
 ): Promise<void> {
-	const views = (notion as NotionWithViews).views;
+	const views = notionViews(notion);
 	if (!views || scan.childDbsByTitle.has(name)) return;
 	await views.create({
 		create_database: { parent: { type: "page_id", page_id: rootId } },
