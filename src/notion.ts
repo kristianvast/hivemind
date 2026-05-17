@@ -223,6 +223,7 @@ export type BriefStatus =
 
 export type BriefOwner =
 	| "Triage"
+	| "Architect"
 	| "Scout"
 	| "Forge"
 	| "Scribe"
@@ -499,6 +500,179 @@ export function bookmark(url: string): BlockObjectRequest {
 		type: "bookmark",
 		bookmark: { url },
 	};
+}
+
+export function equation(expression: string): BlockObjectRequest {
+	return {
+		type: "equation",
+		equation: { expression },
+	};
+}
+
+export function embed(url: string): BlockObjectRequest {
+	return {
+		type: "embed",
+		embed: { url },
+	};
+}
+
+interface FileLike {
+	url?: string;
+	file_upload_id?: string;
+	caption?: string;
+}
+
+function buildExternalOrUpload(
+	source: FileLike,
+):
+	| { type: "external"; external: { url: string } }
+	| { type: "file_upload"; file_upload: { id: string } } {
+	if (source.url) {
+		return { type: "external", external: { url: source.url } };
+	}
+	if (source.file_upload_id) {
+		return {
+			type: "file_upload",
+			file_upload: { id: source.file_upload_id },
+		};
+	}
+	throw new Error(
+		"buildExternalOrUpload: either `url` or `file_upload_id` is required",
+	);
+}
+
+export function image(source: FileLike): BlockObjectRequest {
+	const inner = buildExternalOrUpload(source);
+	return {
+		type: "image",
+		image: {
+			...inner,
+			caption: source.caption ? rt(source.caption) : undefined,
+		} as never,
+	};
+}
+
+export function video(source: FileLike): BlockObjectRequest {
+	const inner = buildExternalOrUpload(source);
+	return {
+		type: "video",
+		video: {
+			...inner,
+			caption: source.caption ? rt(source.caption) : undefined,
+		} as never,
+	};
+}
+
+export function audio(source: FileLike): BlockObjectRequest {
+	const inner = buildExternalOrUpload(source);
+	return {
+		type: "audio",
+		audio: {
+			...inner,
+			caption: source.caption ? rt(source.caption) : undefined,
+		} as never,
+	};
+}
+
+export function pdf(source: FileLike): BlockObjectRequest {
+	const inner = buildExternalOrUpload(source);
+	return {
+		type: "pdf",
+		pdf: {
+			...inner,
+			caption: source.caption ? rt(source.caption) : undefined,
+		} as never,
+	};
+}
+
+export function file(
+	source: FileLike & { name?: string },
+): BlockObjectRequest {
+	const inner = buildExternalOrUpload(source);
+	return {
+		type: "file",
+		file: {
+			...inner,
+			name: source.name,
+			caption: source.caption ? rt(source.caption) : undefined,
+		} as never,
+	};
+}
+
+export function linkToPage(args: {
+	page_id?: string;
+	database_id?: string;
+}): BlockObjectRequest {
+	if (args.page_id) {
+		return {
+			type: "link_to_page",
+			link_to_page: { type: "page_id", page_id: args.page_id },
+		};
+	}
+	if (args.database_id) {
+		return {
+			type: "link_to_page",
+			link_to_page: {
+				type: "database_id",
+				database_id: args.database_id,
+			} as never,
+		};
+	}
+	throw new Error("linkToPage: either page_id or database_id is required");
+}
+
+export function tableBlock(args: {
+	rows: string[][];
+	hasColumnHeader?: boolean;
+	hasRowHeader?: boolean;
+}): BlockObjectRequest {
+	const width = args.rows[0]?.length ?? 0;
+	if (width === 0) {
+		throw new Error("tableBlock: rows must be non-empty");
+	}
+	if (args.rows.some((r) => r.length !== width)) {
+		throw new Error("tableBlock: every row must have the same number of cells");
+	}
+	const rowBlocks: BlockObjectRequest[] = args.rows.map((row) => ({
+		type: "table_row",
+		table_row: {
+			cells: row.map((cell) => rt(cell)),
+		},
+	}));
+	return {
+		type: "table",
+		table: {
+			table_width: width,
+			has_column_header: args.hasColumnHeader ?? false,
+			has_row_header: args.hasRowHeader ?? false,
+			children: rowBlocks as never,
+		},
+	};
+}
+
+export function syncedBlock(args: {
+	syncedFromBlockId?: string;
+	children?: BlockObjectRequest[];
+}): BlockObjectRequest {
+	if (args.syncedFromBlockId) {
+		return {
+			type: "synced_block",
+			synced_block: {
+				synced_from: { block_id: args.syncedFromBlockId } as never,
+			},
+		};
+	}
+	return {
+		type: "synced_block",
+		synced_block: {
+			synced_from: null,
+			children: (args.children ?? []) as never,
+		},
+	};
+}
+
+export function breadcrumb(): BlockObjectRequest {
+	return { type: "breadcrumb", breadcrumb: {} };
 }
 
 export async function reportChainFailure(

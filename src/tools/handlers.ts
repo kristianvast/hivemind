@@ -13,22 +13,85 @@ import type {
 	UpdateBlockParameters,
 } from "@notionhq/client";
 
-import type { AgentContext, ToolDispatcher } from "../agentLoop";
+import { runAgent, type AgentContext, type ToolDispatcher } from "../agentLoop";
+import { appendAudit } from "../audit";
 import type { TokenBudget } from "../budget";
 import {
+	failRun,
+	finishRun,
+	startRun,
+	type RunAgent,
+} from "../runs";
+import {
+	getLibrarianSpec,
+	getOracleSpec,
+	getScoutSubagentSpec,
+} from "../subagents";
+import {
+	createView,
+	deleteView,
+	listViews,
+	queryView,
+	retrieveView,
+	updateView,
+	type ViewType,
+} from "../views";
+import { getWorkspaceHomeIdsFromEnv } from "../workspaceHome";
+import { getToolsForAgent, type AgentName } from "./registry";
+
+function briefUrlFor(briefId: string): string {
+	return `https://www.notion.so/${briefId.replace(/-/g, "")}`;
+}
+
+function agentDisplayName(name: ToolHandlerContext["agentName"]): string {
+	if (name === "Forge" || name === "Scribe") return "Architect";
+	return name;
+}
+
+async function auditIfExternal(
+	ctx: ToolHandlerContext,
+	op: string,
+	pageId: string,
+	detail?: string,
+): Promise<void> {
+	const scope = await ctx.scopeGuard.classifyTarget(pageId);
+	if (scope !== "external") return;
+	await appendAudit({
+		notion: ctx.notion,
+		pacer: ctx.pacer,
+		agent: agentDisplayName(ctx.agentName),
+		op,
+		briefUrl: briefUrlFor(ctx.briefMetadata.id),
+		targetPageId: pageId,
+		status: "ok",
+		detail,
+	});
+}
+import {
+	audio,
 	bookmark,
+	breadcrumb,
 	bullet,
 	callout,
 	code,
 	divider,
+	embed,
+	equation,
+	file as fileBlock,
 	heading2,
 	heading3,
+	image,
+	linkToPage,
 	mdToBlocks,
 	numbered,
 	paragraph,
+	pdf,
 	setBriefProperties,
+	tableBlock,
+	tableOfContents,
 	todoBlock,
 	toggle,
+	video,
 } from "../notion";
 import type { BriefOwner, BriefStatus } from "../notion";
 import type { Pacer } from "../pacer";
@@ -51,9 +114,11 @@ export interface ToolHandlerContext extends AgentContext {
 	scopeGuard: ScopeGuard;
 	pacer: Pacer;
 	tokenBudget: TokenBudget;
-	agentName: "Scout" | "Forge" | "Scribe" | "Sentinel";
+	agentName: "Architect" | "Scout" | "Librarian" | "Oracle" | "Forge" | "Scribe" | "Sentinel";
 	/** Populated by setVerdict; read by orchestrator after agent finishes. */
 	verdict?: { verdict: "approve" | "needs-revision"; summary: string };
+	/** Populated by done(summary); read by parent after sub-agent finishes. */
+	doneSummary?: string;
 }
 
 type BlockShapeType =
@@ -68,7 +133,18 @@ type BlockShapeType =
 	| "callout"
 	| "toggle"
 	| "divider"
-	| "bookmark";
+	| "bookmark"
+	| "equation"
+	| "embed"
+	| "image"
+	| "video"
+	| "audio"
+	| "pdf"
+	| "file"
+	| "link_to_page"
+	| "table"
+	| "breadcrumb"
+	| "table_of_contents";
 
 interface BlockShape {
 	type: BlockShapeType;
@@ -78,6 +154,13 @@ interface BlockShape {
 	emoji?: string;
 	color?: string;
 	url?: string;
+	caption?: string;
+	file_upload_id?: string;
+	target_page_id?: string;
+	target_database_id?: string;
+	rows?: string[][];
+	has_column_header?: boolean;
+	has_row_header?: boolean;
 }
 
 function inlineRichText(
@@ -115,6 +198,66 @@ function blockShapeToNotion(b: BlockShape): BlockObjectRequest {
 			if (!b.url)
 				throw new Error("blockShapeToNotion: bookmark block requires url");
 			return bookmark(b.url);
+		case "equation":
+			if (!b.text)
+				throw new Error(
+					"blockShapeToNotion: equation block requires `text` (LaTeX expression)",
+				);
+			return equation(b.text);
+		case "embed":
+			if (!b.url)
+				throw new Error("blockShapeToNotion: embed block requires url");
+			return embed(b.url);
+		case "image":
+			return image({
+				url: b.url,
+				file_upload_id: b.file_upload_id,
+				caption: b.caption,
+			});
+		case "video":
+			return video({
+				url: b.url,
+				file_upload_id: b.file_upload_id,
+				caption: b.caption,
+			});
+		case "audio":
+			return audio({
+				url: b.url,
+				file_upload_id: b.file_upload_id,
+				caption: b.caption,
+			});
+		case "pdf":
+			return pdf({
+				url: b.url,
+				file_upload_id: b.file_upload_id,
+				caption: b.caption,
+			});
+		case "file":
+			return fileBlock({
+				url: b.url,
+				file_upload_id: b.file_upload_id,
+				caption: b.caption,
+				name: b.text,
+			});
+		case "link_to_page":
+			return linkToPage({
+				page_id: b.target_page_id,
+				database_id: b.target_database_id,
+			});
+		case "table":
+			if (!b.rows || b.rows.length === 0)
+				throw new Error(
+					"blockShapeToNotion: table block requires non-empty `rows`",
+				);
+			return tableBlock({
+				rows: b.rows,
+				hasColumnHeader: b.has_column_header,
+				hasRowHeader: b.has_row_header,
+			});
+		case "breadcrumb":
+			return breadcrumb();
+		case "table_of_contents":
+			return tableOfContents();
 		default: {
 			const exhaustive: never = b.type;
 			throw new Error(
@@ -236,9 +379,32 @@ function asBlockShape(x: unknown, name: string): BlockShape {
 		"toggle",
 		"divider",
 		"bookmark",
+		"equation",
+		"embed",
+		"image",
+		"video",
+		"audio",
+		"pdf",
+		"file",
+		"link_to_page",
+		"table",
+		"breadcrumb",
+		"table_of_contents",
 	];
 	if (!(allowed as readonly string[]).includes(t)) {
 		throw new Error(`${name}.type "${t}" is not a supported block type`);
+	}
+	let rows: string[][] | undefined;
+	if (r.rows !== undefined) {
+		if (!Array.isArray(r.rows)) {
+			throw new Error(`${name}.rows must be an array of arrays of strings`);
+		}
+		rows = r.rows.map((row, i) => {
+			if (!Array.isArray(row)) {
+				throw new Error(`${name}.rows[${i}] must be an array of strings`);
+			}
+			return row.map((cell, j) => asString(cell, `${name}.rows[${i}][${j}]`));
+		});
 	}
 	return {
 		type: t as BlockShapeType,
@@ -248,6 +414,18 @@ function asBlockShape(x: unknown, name: string): BlockShape {
 		emoji: asOptString(r.emoji, `${name}.emoji`),
 		color: asOptString(r.color, `${name}.color`),
 		url: asOptString(r.url, `${name}.url`),
+		caption: asOptString(r.caption, `${name}.caption`),
+		file_upload_id: asOptString(r.file_upload_id, `${name}.file_upload_id`),
+		target_page_id: asOptString(r.target_page_id, `${name}.target_page_id`),
+		target_database_id: asOptString(
+			r.target_database_id,
+			`${name}.target_database_id`,
+		),
+		rows,
+		has_column_header:
+			typeof r.has_column_header === "boolean" ? r.has_column_header : undefined,
+		has_row_header:
+			typeof r.has_row_header === "boolean" ? r.has_row_header : undefined,
 	};
 }
 
@@ -556,36 +734,76 @@ async function walkBlockToPage(
 
 type Handler = (input: unknown, ctx: ToolHandlerContext) => Promise<unknown>;
 
-function requireDraftsDsId(ctx: ToolHandlerContext, toolName: string): string {
-	const id = ctx.projectIds.dbs.drafts?.dsId;
-	if (!id) {
-		throw new Error(
-			`${toolName}: this brief was provisioned without a Drafts database (category=${ctx.briefMetadata.category}). Use writeAnswer for the answer.`,
-		);
+let cachedSubDispatcher: ToolDispatcher | undefined;
+function subDispatcherSingleton(): ToolDispatcher {
+	return (cachedSubDispatcher ??= new HivemindToolDispatcher());
+}
+
+function buildPropertyConfig(
+	type: string,
+	options: Array<{ name: string; color?: string }> | undefined,
+	expression: string | undefined,
+	relatedDataSourceId: string | undefined,
+): Record<string, unknown> {
+	switch (type) {
+		case "title":
+			return { type: "title", title: {} };
+		case "rich_text":
+			return { type: "rich_text", rich_text: {} };
+		case "number":
+			return { type: "number", number: { format: "number" } };
+		case "select":
+			return { type: "select", select: { options: options ?? [] } };
+		case "multi_select":
+			return {
+				type: "multi_select",
+				multi_select: { options: options ?? [] },
+			};
+		case "status":
+			return { type: "status", status: { options: options ?? [] } };
+		case "date":
+			return { type: "date", date: {} };
+		case "people":
+			return { type: "people", people: {} };
+		case "files":
+			return { type: "files", files: {} };
+		case "checkbox":
+			return { type: "checkbox", checkbox: {} };
+		case "url":
+			return { type: "url", url: {} };
+		case "email":
+			return { type: "email", email: {} };
+		case "phone_number":
+			return { type: "phone_number", phone_number: {} };
+		case "formula":
+			if (!expression)
+				throw new Error("formula property requires `expression`");
+			return { type: "formula", formula: { expression } };
+		case "relation":
+			if (!relatedDataSourceId)
+				throw new Error("relation property requires `related_data_source_id`");
+			return {
+				type: "relation",
+				relation: {
+					data_source_id: relatedDataSourceId,
+					single_property: {},
+				},
+			};
+		case "created_time":
+			return { type: "created_time", created_time: {} };
+		case "created_by":
+			return { type: "created_by", created_by: {} };
+		case "last_edited_time":
+			return { type: "last_edited_time", last_edited_time: {} };
+		case "last_edited_by":
+			return { type: "last_edited_by", last_edited_by: {} };
+		case "unique_id":
+			return { type: "unique_id", unique_id: {} };
+		case "verification":
+			return { type: "verification", verification: {} };
+		default:
+			throw new Error(`buildPropertyConfig: unsupported type "${type}"`);
 	}
-	return id;
-}
-
-function requirePlanPageId(ctx: ToolHandlerContext, toolName: string): string {
-	const id = ctx.projectIds.planPageId;
-	if (!id) {
-		throw new Error(
-			`${toolName}: this brief (category=${ctx.briefMetadata.category}) was provisioned without a Plan page.`,
-		);
-	}
-	return id;
-}
-
-function optionalSourcesDsId(ctx: ToolHandlerContext): string | undefined {
-	return ctx.projectIds.dbs.sources?.dsId;
-}
-
-function optionalDecisionsDsId(ctx: ToolHandlerContext): string | undefined {
-	return ctx.projectIds.dbs.decisions?.dsId;
-}
-
-function optionalOpenQuestionsDsId(ctx: ToolHandlerContext): string | undefined {
-	return ctx.projectIds.dbs.openQuestions?.dsId;
 }
 
 function outputTypeForCategory(category: string | null): string {
@@ -695,11 +913,6 @@ const HANDLERS: Record<string, Handler> = {
 		const r = asRecord(input);
 		const section = asString(r.section, "section");
 		const planPageId = ctx.projectIds.planPageId;
-		if (!planPageId) {
-			throw new Error(
-				`readPlanSection: this brief (category=${ctx.briefMetadata.category}) was provisioned without a Plan page. No sections to read.`,
-			);
-		}
 		const blocks = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
 		const out: string[] = [];
 		let inSection = false;
@@ -729,7 +942,7 @@ const HANDLERS: Record<string, Handler> = {
 	},
 
 	async listDrafts(_input, ctx) {
-		const dsId = requireDraftsDsId(ctx, "listDrafts");
+		const dsId = ctx.projectIds.dbs.drafts.dsId;
 		await ctx.pacer.acquire();
 		const res = await ctx.notion.dataSources.query({
 			data_source_id: dsId,
@@ -808,7 +1021,7 @@ const HANDLERS: Record<string, Handler> = {
 		const r = asRecord(input);
 		const pageId = asString(r.page_id, "page_id");
 		const blocks = asBlockShapeArray(r.blocks, "blocks");
-		await ctx.scopeGuard.assertAllowed(pageId);
+		await auditIfExternal(ctx, "appendBlocks", pageId, `${blocks.length} blocks`);
 		await ctx.pacer.acquire();
 		const res = await ctx.notion.blocks.children.append({
 			block_id: pageId,
@@ -822,7 +1035,7 @@ const HANDLERS: Record<string, Handler> = {
 		const blockId = asString(r.block_id, "block_id");
 		const block = asBlockShape(r.block, "block");
 		const pageId = await walkBlockToPage(ctx.notion, ctx.pacer, blockId);
-		await ctx.scopeGuard.assertAllowed(pageId);
+		await auditIfExternal(ctx, "updateBlock", pageId, `block=${blockId}`);
 		await ctx.pacer.acquire();
 		const notionBlock = blockShapeToNotion(block);
 		await ctx.notion.blocks.update(
@@ -835,7 +1048,7 @@ const HANDLERS: Record<string, Handler> = {
 		const r = asRecord(input);
 		const blockId = asString(r.block_id, "block_id");
 		const pageId = await walkBlockToPage(ctx.notion, ctx.pacer, blockId);
-		await ctx.scopeGuard.assertAllowed(pageId);
+		await auditIfExternal(ctx, "deleteBlock", pageId, `block=${blockId}`);
 		await ctx.pacer.acquire();
 		await ctx.notion.blocks.delete({ block_id: blockId });
 		return { deleted: true };
@@ -846,11 +1059,6 @@ const HANDLERS: Record<string, Handler> = {
 		const section = asString(r.section, "section");
 		const newBlocks = asBlockShapeArray(r.blocks, "blocks");
 		const planPageId = ctx.projectIds.planPageId;
-		if (!planPageId) {
-			throw new Error(
-				`setPlanSection: this brief (category=${ctx.briefMetadata.category}) was provisioned without a Plan page.`,
-			);
-		}
 		await ctx.scopeGuard.assertAllowed(planPageId);
 
 		const all = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
@@ -899,11 +1107,6 @@ const HANDLERS: Record<string, Handler> = {
 		const section = asString(r.section, "section");
 		const newBlocks = asBlockShapeArray(r.blocks, "blocks");
 		const planPageId = ctx.projectIds.planPageId;
-		if (!planPageId) {
-			throw new Error(
-				`appendToPlanSection: this brief (category=${ctx.briefMetadata.category}) was provisioned without a Plan page.`,
-			);
-		}
 		await ctx.scopeGuard.assertAllowed(planPageId);
 
 		const all = await listAllBlocks(ctx.notion, ctx.pacer, planPageId);
@@ -949,7 +1152,7 @@ const HANDLERS: Record<string, Handler> = {
 		const title = asString(r.title, "title");
 		const blocks =
 			r.blocks !== undefined ? asBlockShapeArray(r.blocks, "blocks") : [];
-		await ctx.scopeGuard.assertAllowed(parentId);
+		await auditIfExternal(ctx, "createChildPage", parentId, `title=${title}`);
 		await ctx.pacer.acquire();
 		const properties: CreatePageParameters["properties"] = {
 			title: { title: [{ type: "text", text: { content: title } }] },
@@ -970,11 +1173,6 @@ const HANDLERS: Record<string, Handler> = {
 
 		const rootId = ctx.projectIds.projectRootId;
 		const anchorId = ctx.projectIds.answerAnchorBlockId;
-		if (!anchorId) {
-			throw new Error(
-				"writeAnswer: project has no answer anchor — this brief was provisioned with the Drafts DB path. Use createDraft instead.",
-			);
-		}
 		await ctx.scopeGuard.assertAllowed(rootId);
 
 		const existing = await listAllBlocks(ctx.notion, ctx.pacer, rootId);
@@ -1032,7 +1230,7 @@ const HANDLERS: Record<string, Handler> = {
 			"based_on_draft_id",
 		);
 
-		const dsId = requireDraftsDsId(ctx, "createDraft");
+		const dsId = ctx.projectIds.dbs.drafts.dsId;
 		await ctx.pacer.acquire();
 		const topRes = await ctx.notion.dataSources.query({
 			data_source_id: dsId,
@@ -1142,32 +1340,34 @@ const HANDLERS: Record<string, Handler> = {
 			children: blocks,
 		});
 
-		await ctx.pacer.acquire();
-		const reviewCount = isFullPage(draft)
-			? (extractNumber(draft.properties["Review Count"]) ?? 0) + 1
-			: 1;
-		const qualityScore = verdict === "approve" ? 100 : Math.max(40, 85 - risks.length * 10);
-		const riskLevel = verdict === "approve"
-			? risks.length > 1
-				? "medium"
-				: "low"
-			: risks.length > 2
-				? "high"
-				: "medium";
-		const properties: CreatePageParameters["properties"] = {
-			"Last Verdict": { select: { name: verdict } },
-			"Review Count": { number: reviewCount },
-			"Quality Score": { number: qualityScore },
-			"Risk Level": { select: { name: riskLevel } },
-		};
-		if (verdict === "approve") {
-			properties["Approved At"] = { date: { start: new Date().toISOString() } };
+		const isRealDraft = draftId !== ctx.projectIds.projectRootId;
+		if (isRealDraft) {
+			await ctx.pacer.acquire();
+			const reviewCount = isFullPage(draft)
+				? (extractNumber(draft.properties["Review Count"]) ?? 0) + 1
+				: 1;
+			const qualityScore = verdict === "approve" ? 100 : Math.max(40, 85 - risks.length * 10);
+			const riskLevel = verdict === "approve"
+				? risks.length > 1
+					? "medium"
+					: "low"
+				: risks.length > 2
+					? "high"
+					: "medium";
+			const properties: CreatePageParameters["properties"] = {
+				"Last Verdict": { select: { name: verdict } },
+				"Review Count": { number: reviewCount },
+				"Quality Score": { number: qualityScore },
+				"Risk Level": { select: { name: riskLevel } },
+			};
+			if (verdict === "approve") {
+				properties["Approved At"] = { date: { start: new Date().toISOString() } };
+			}
+			await ctx.notion.pages.update({
+				page_id: draftId,
+				properties,
+			});
 		}
-
-		await ctx.notion.pages.update({
-			page_id: draftId,
-			properties,
-		});
 
 		return { draft_id: draftId, iteration: iterationLabel, verdict };
 	},
@@ -1178,32 +1378,28 @@ const HANDLERS: Record<string, Handler> = {
 		const url = asString(r.url, "url");
 		const summary = asOptString(r.summary, "summary");
 
-		const planPageId = requirePlanPageId(ctx, "createSource");
+		const planPageId = ctx.projectIds.planPageId;
 		await ctx.scopeGuard.assertAllowed(planPageId);
-		const dsId = optionalSourcesDsId(ctx);
-		let sourceId: string | undefined;
-		if (dsId) {
-			await ctx.pacer.acquire();
-			const page = await ctx.notion.pages.create({
-				parent: { type: "data_source_id", data_source_id: dsId },
-				properties: {
-					Name: { title: [{ type: "text", text: { content: title } }] },
-					URL: { url },
-					Summary: { rich_text: summary ? inlineRichText(summary) : [] },
-					"Captured By": { select: { name: ctx.agentName } },
-					"Captured At": { date: { start: new Date().toISOString() } },
-				},
-			});
-			sourceId = page.id;
-			ctx.scopeGuard.registerCreated(page.id);
-		}
+		const dsId = ctx.projectIds.dbs.sources.dsId;
+		await ctx.pacer.acquire();
+		const page = await ctx.notion.pages.create({
+			parent: { type: "data_source_id", data_source_id: dsId },
+			properties: {
+				Name: { title: [{ type: "text", text: { content: title } }] },
+				URL: { url },
+				Summary: { rich_text: summary ? inlineRichText(summary) : [] },
+				"Captured By": { select: { name: ctx.agentName } },
+				"Captured At": { date: { start: new Date().toISOString() } },
+			},
+		});
+		ctx.scopeGuard.registerCreated(page.id);
 
 		const tail = summary ? ` — ${summary}` : "";
 		const blocks: BlockObjectRequest[] = [
 			bullet(`${title} (${url})${tail}  · captured by ${ctx.agentName}`),
 		];
 		await appendToPlanSectionHelper(ctx, planPageId, "Sources", blocks);
-		return { ok: true, source_id: sourceId };
+		return { ok: true, source_id: page.id };
 	},
 
 	async createDecision(input, ctx) {
@@ -1216,28 +1412,24 @@ const HANDLERS: Record<string, Handler> = {
 			"alternatives_considered",
 		);
 
-		const planPageId = requirePlanPageId(ctx, "createDecision");
+		const planPageId = ctx.projectIds.planPageId;
 		await ctx.scopeGuard.assertAllowed(planPageId);
-		const dsId = optionalDecisionsDsId(ctx);
-		let decisionId: string | undefined;
-		if (dsId) {
-			await ctx.pacer.acquire();
-			const page = await ctx.notion.pages.create({
-				parent: { type: "data_source_id", data_source_id: dsId },
-				properties: {
-					Name: { title: [{ type: "text", text: { content: title } }] },
-					Choice: { rich_text: inlineRichText(choice) },
-					Rationale: { rich_text: inlineRichText(rationale) },
-					"Alternatives Considered": {
-						rich_text: alternatives ? inlineRichText(alternatives.join("\n")) : [],
-					},
-					"Made By": { select: { name: ctx.agentName } },
-					"Made At": { date: { start: new Date().toISOString() } },
+		const dsId = ctx.projectIds.dbs.decisions.dsId;
+		await ctx.pacer.acquire();
+		const page = await ctx.notion.pages.create({
+			parent: { type: "data_source_id", data_source_id: dsId },
+			properties: {
+				Name: { title: [{ type: "text", text: { content: title } }] },
+				Choice: { rich_text: inlineRichText(choice) },
+				Rationale: { rich_text: inlineRichText(rationale) },
+				"Alternatives Considered": {
+					rich_text: alternatives ? inlineRichText(alternatives.join("\n")) : [],
 				},
-			});
-			decisionId = page.id;
-			ctx.scopeGuard.registerCreated(page.id);
-		}
+				"Made By": { select: { name: ctx.agentName } },
+				"Made At": { date: { start: new Date().toISOString() } },
+			},
+		});
+		ctx.scopeGuard.registerCreated(page.id);
 
 		const blocks: BlockObjectRequest[] = [
 			heading3(`${title} — ${ctx.agentName}, ${new Date().toISOString()}`),
@@ -1249,7 +1441,7 @@ const HANDLERS: Record<string, Handler> = {
 			for (const a of alternatives) blocks.push(bullet(a));
 		}
 		await appendToPlanSectionHelper(ctx, planPageId, "Decisions", blocks);
-		return { ok: true, decision_id: decisionId };
+		return { ok: true, decision_id: page.id };
 	},
 
 	async createOpenQuestion(input, ctx) {
@@ -1257,34 +1449,30 @@ const HANDLERS: Record<string, Handler> = {
 		const question = asString(r.question, "question");
 		const whyItMatters = asOptString(r.why_it_matters, "why_it_matters");
 
-		const planPageId = requirePlanPageId(ctx, "createOpenQuestion");
+		const planPageId = ctx.projectIds.planPageId;
 		await ctx.scopeGuard.assertAllowed(planPageId);
-		const dsId = optionalOpenQuestionsDsId(ctx);
-		let questionId: string | undefined;
-		if (dsId) {
-			await ctx.pacer.acquire();
-			const page = await ctx.notion.pages.create({
-				parent: { type: "data_source_id", data_source_id: dsId },
-				properties: {
-					Name: { title: [{ type: "text", text: { content: question } }] },
-					"Why It Matters": {
-						rich_text: whyItMatters ? inlineRichText(whyItMatters) : [],
-					},
-					Status: { select: { name: "open" } },
-					"Asked By": { select: { name: ctx.agentName } },
-					"Asked At": { date: { start: new Date().toISOString() } },
+		const dsId = ctx.projectIds.dbs.openQuestions.dsId;
+		await ctx.pacer.acquire();
+		const page = await ctx.notion.pages.create({
+			parent: { type: "data_source_id", data_source_id: dsId },
+			properties: {
+				Name: { title: [{ type: "text", text: { content: question } }] },
+				"Why It Matters": {
+					rich_text: whyItMatters ? inlineRichText(whyItMatters) : [],
 				},
-			});
-			questionId = page.id;
-			ctx.scopeGuard.registerCreated(page.id);
-		}
+				Status: { select: { name: "open" } },
+				"Asked By": { select: { name: ctx.agentName } },
+				"Asked At": { date: { start: new Date().toISOString() } },
+			},
+		});
+		ctx.scopeGuard.registerCreated(page.id);
 
 		const tail = whyItMatters ? ` — ${whyItMatters}` : "";
 		const blocks: BlockObjectRequest[] = [
 			bullet(`${question}${tail}  · asked by ${ctx.agentName}`),
 		];
 		await appendToPlanSectionHelper(ctx, planPageId, "Open Questions", blocks);
-		return { ok: true, question_id: questionId };
+		return { ok: true, question_id: page.id };
 	},
 
 	async addComment(input, ctx) {
@@ -1297,10 +1485,10 @@ const HANDLERS: Record<string, Handler> = {
 		const blockIdRaw = target.block_id;
 		if (typeof pageIdRaw === "string") {
 			pageId = pageIdRaw;
-			await ctx.scopeGuard.assertAllowed(pageId);
+			await auditIfExternal(ctx, "addComment", pageId, `text=${text.slice(0, 80)}`);
 		} else if (typeof blockIdRaw === "string") {
 			pageId = await walkBlockToPage(ctx.notion, ctx.pacer, blockIdRaw);
-			await ctx.scopeGuard.assertAllowed(pageId);
+			await auditIfExternal(ctx, "addComment", pageId, `block=${blockIdRaw}`);
 		} else {
 			throw new Error("addComment: target must have page_id or block_id");
 		}
@@ -1358,12 +1546,734 @@ const HANDLERS: Record<string, Handler> = {
 		return { verdict_set: true };
 	},
 
-	async done(input, _ctx) {
+	async done(input, ctx) {
 		const r = asRecord(input);
 		const summary = asOptString(r.summary, "summary");
+		if (summary) ctx.doneSummary = summary;
 		return { ok: true, summary };
 	},
+
+	async delegateScout(input, ctx) {
+		const r = asRecord(input);
+		const query = asString(r.query, "query");
+		const context = asOptString(r.context, "context");
+		const spec = getScoutSubagentSpec();
+		return runDelegation(ctx, "Scout", spec, query, context);
+	},
+
+	async delegateLibrarian(input, ctx) {
+		const r = asRecord(input);
+		const query = asString(r.query, "query");
+		const context = asOptString(r.context, "context");
+		const spec = getLibrarianSpec();
+		return runDelegation(ctx, "Librarian", spec, query, context);
+	},
+
+	async delegateOracle(input, ctx) {
+		const r = asRecord(input);
+		const question = asString(r.question, "question");
+		const context = asOptString(r.context, "context");
+		const spec = getOracleSpec();
+		const result = await runDelegation(ctx, "Oracle", spec, question, context);
+		return {
+			analysis: result.summary,
+			tool_calls: result.tool_calls,
+			turns: result.turns,
+			tokens: result.tokens,
+			duration_ms: result.duration_ms,
+		};
+	},
+
+	async getWorkspaceHome(_input, _ctx) {
+		const ids = getWorkspaceHomeIdsFromEnv();
+		if (!ids) {
+			return {
+				configured: false,
+				message:
+					"Workspace home not configured. Admin must run `npx tsx scripts/provisionWorkspaceHome.ts` and push the resulting env vars.",
+			};
+		}
+		return {
+			configured: true,
+			home_page_id: ids.homePageId,
+			activity_db_id: ids.activityDbId,
+			activity_ds_id: ids.activityDsId,
+		};
+	},
+
+	async readPageMarkdown(input, ctx) {
+		const r = asRecord(input);
+		const pageId = asString(r.page_id, "page_id");
+		const includeTranscript =
+			typeof r.include_transcript === "boolean"
+				? r.include_transcript
+				: undefined;
+		await ctx.pacer.acquire();
+		const res = (await (ctx.notion.pages.retrieveMarkdown as unknown as (a: unknown) => Promise<{
+			markdown?: string;
+			results?: string;
+			truncated?: boolean;
+		}>)({
+			page_id: pageId,
+			include_transcript: includeTranscript,
+		})) as { markdown?: string; results?: string; truncated?: boolean };
+		return {
+			markdown: res.markdown ?? res.results ?? "",
+			truncated: res.truncated ?? false,
+		};
+	},
+
+	async manageDatabase(input, ctx) {
+		const r = asRecord(input);
+		const op = asString(r.op, "op");
+		await ctx.pacer.acquire();
+		switch (op) {
+			case "create": {
+				const parentPageId = asString(r.parent_page_id, "parent_page_id");
+				const title = asString(r.title, "title");
+				const schema = r.schema as Record<string, unknown> | undefined;
+				if (!schema || Object.keys(schema).length === 0) {
+					throw new Error(
+						"manageDatabase create: provide `schema` with at least one property",
+					);
+				}
+				await auditIfExternal(ctx, "manageDatabase", parentPageId, `op=create title=${title}`);
+				const res = await ctx.notion.databases.create({
+					parent: { type: "page_id", page_id: parentPageId },
+					title: [{ type: "text", text: { content: title } }],
+					initial_data_source: { properties: schema as never },
+				});
+				if (!("data_sources" in res)) {
+					throw new Error(
+						"manageDatabase create: partial response (missing data_sources)",
+					);
+				}
+				const primary = res.data_sources[0];
+				return {
+					database_id: res.id,
+					data_source_id: primary?.id ?? null,
+				};
+			}
+			case "update": {
+				const databaseId = asString(r.database_id, "database_id");
+				const title = asOptString(r.title, "title");
+				if (!title) {
+					throw new Error("manageDatabase update: provide title");
+				}
+				await ctx.notion.databases.update({
+					database_id: databaseId,
+					title: [{ type: "text", text: { content: title } }],
+				});
+				return { ok: true };
+			}
+			case "addProperty": {
+				const dataSourceId = asString(r.data_source_id, "data_source_id");
+				const propName = asString(r.property_name, "property_name");
+				const propType = asString(r.property_type, "property_type");
+				const options = Array.isArray(r.options)
+					? r.options.map((o) => {
+							const rec = asRecord(o);
+							return {
+								name: asString(rec.name, "options[].name"),
+								color: asOptString(rec.color, "options[].color") as never,
+							};
+						})
+					: undefined;
+				const propConfig = buildPropertyConfig(
+					propType,
+					options,
+					asOptString(r.expression, "expression"),
+					asOptString(r.related_data_source_id, "related_data_source_id"),
+				);
+				await ctx.notion.dataSources.update({
+					data_source_id: dataSourceId,
+					properties: { [propName]: propConfig as never },
+				});
+				return { ok: true };
+			}
+			case "removeProperty": {
+				const dataSourceId = asString(r.data_source_id, "data_source_id");
+				const propName = asString(r.property_name, "property_name");
+				await ctx.notion.dataSources.update({
+					data_source_id: dataSourceId,
+					properties: { [propName]: null as never },
+				});
+				return { ok: true };
+			}
+			case "listTemplates": {
+				const dataSourceId = asString(r.data_source_id, "data_source_id");
+				const res = (await (
+					ctx.notion.dataSources as unknown as {
+						templates: { list: (a: unknown) => Promise<{ results: Array<{ id: string; name?: string }> }> };
+					}
+				).templates.list({ data_source_id: dataSourceId })) as {
+					results: Array<{ id: string; name?: string }>;
+				};
+				return {
+					templates: res.results.map((t) => ({
+						id: t.id,
+						name: t.name ?? "",
+					})),
+				};
+			}
+			case "retrieve": {
+				const databaseId = asString(r.database_id, "database_id");
+				const res = await ctx.notion.databases.retrieve({
+					database_id: databaseId,
+				});
+				return res;
+			}
+			default:
+				throw new Error(`manageDatabase: unknown op "${op}"`);
+		}
+	},
+
+	async createPageFromTemplate(input, ctx) {
+		const r = asRecord(input);
+		const dataSourceId = asString(r.data_source_id, "data_source_id");
+		const templateId = asOptString(r.template_id, "template_id");
+		const useDefault =
+			typeof r.use_default === "boolean" ? r.use_default : false;
+		const timezone = asOptString(r.timezone, "timezone");
+		const properties = (r.properties as Record<string, unknown> | undefined) ?? {};
+		let template:
+			| { type: "default"; timezone?: string }
+			| { type: "template_id"; template_id: string; timezone?: string };
+		if (useDefault) {
+			template = { type: "default", timezone };
+		} else if (templateId) {
+			template = { type: "template_id", template_id: templateId, timezone };
+		} else {
+			throw new Error(
+				"createPageFromTemplate: provide either template_id or use_default=true",
+			);
+		}
+		await ctx.pacer.acquire();
+		const res = await ctx.notion.pages.create({
+			parent: { type: "data_source_id", data_source_id: dataSourceId },
+			properties: properties as never,
+			template: template as never,
+		});
+		return { page_id: res.id };
+	},
+
+	async managePage(input, ctx) {
+		const r = asRecord(input);
+		const op = asString(r.op, "op");
+		const pageId = asString(r.page_id, "page_id");
+		await auditIfExternal(ctx, "managePage", pageId, `op=${op}`);
+		await ctx.pacer.acquire();
+		switch (op) {
+			case "setIcon": {
+				const emoji = asOptString(r.emoji, "emoji");
+				const externalUrl = asOptString(r.external_url, "external_url");
+				const fileUploadId = asOptString(r.file_upload_id, "file_upload_id");
+				const iconName = asOptString(r.icon_name, "icon_name");
+				const iconColor = asOptString(r.icon_color, "icon_color");
+				let icon: Record<string, unknown> | null = null;
+				if (emoji) {
+					icon = { type: "emoji", emoji };
+				} else if (externalUrl) {
+					icon = { type: "external", external: { url: externalUrl } };
+				} else if (fileUploadId) {
+					icon = { type: "file_upload", file_upload: { id: fileUploadId } };
+				} else if (iconName) {
+					icon = {
+						type: "icon",
+						icon: { name: iconName, color: iconColor ?? "default" },
+					};
+				} else {
+					throw new Error(
+						"managePage setIcon: provide one of emoji / external_url / file_upload_id / icon_name",
+					);
+				}
+				await ctx.notion.pages.update({
+					page_id: pageId,
+					icon: icon as never,
+				});
+				return { ok: true };
+			}
+			case "setCover": {
+				const externalUrl = asOptString(r.external_url, "external_url");
+				const fileUploadId = asOptString(r.file_upload_id, "file_upload_id");
+				let cover: Record<string, unknown> | null = null;
+				if (externalUrl) {
+					cover = { type: "external", external: { url: externalUrl } };
+				} else if (fileUploadId) {
+					cover = { type: "file_upload", file_upload: { id: fileUploadId } };
+				} else {
+					throw new Error(
+						"managePage setCover: provide external_url or file_upload_id",
+					);
+				}
+				await ctx.notion.pages.update({
+					page_id: pageId,
+					cover: cover as never,
+				});
+				return { ok: true };
+			}
+			case "setTitle": {
+				const title = asString(r.title, "title");
+				await ctx.notion.pages.update({
+					page_id: pageId,
+					properties: {
+						title: {
+							title: [{ type: "text", text: { content: title } }],
+						},
+					},
+				});
+				return { ok: true };
+			}
+			case "move": {
+				const newParentPageId = asOptString(
+					r.new_parent_page_id,
+					"new_parent_page_id",
+				);
+				const newParentDsId = asOptString(
+					r.new_parent_data_source_id,
+					"new_parent_data_source_id",
+				);
+				let parent: Record<string, unknown>;
+				if (newParentPageId) {
+					parent = { type: "page_id", page_id: newParentPageId };
+				} else if (newParentDsId) {
+					parent = { type: "data_source_id", data_source_id: newParentDsId };
+				} else {
+					throw new Error(
+						"managePage move: provide new_parent_page_id or new_parent_data_source_id",
+					);
+				}
+				await (
+					ctx.notion.pages.move as unknown as (a: unknown) => Promise<unknown>
+				)({
+					page_id: pageId,
+					parent,
+				});
+				return { ok: true };
+			}
+			case "trash": {
+				await ctx.notion.pages.update({
+					page_id: pageId,
+					in_trash: true,
+				});
+				return { ok: true };
+			}
+			case "restore": {
+				await ctx.notion.pages.update({
+					page_id: pageId,
+					in_trash: false,
+				});
+				return { ok: true };
+			}
+			default:
+				throw new Error(`managePage: unknown op "${op}"`);
+		}
+	},
+
+	async uploadFile(input, ctx) {
+		const r = asRecord(input);
+		const externalUrl = asString(r.external_url, "external_url");
+		const filename = asOptString(r.filename, "filename");
+		const contentType = asOptString(r.content_type, "content_type");
+		await ctx.pacer.acquire();
+		const res = (await (
+			ctx.notion.fileUploads.create as unknown as (a: unknown) => Promise<{
+				id: string;
+				status?: string;
+			}>
+		)({
+			mode: "external_url",
+			external_url: externalUrl,
+			filename,
+			content_type: contentType,
+		})) as { id: string; status?: string };
+		return {
+			file_upload_id: res.id,
+			status: res.status ?? "pending",
+		};
+	},
+
+	async manageView(input, ctx) {
+		const r = asRecord(input);
+		const op = asString(r.op, "op");
+		await ctx.pacer.acquire();
+		switch (op) {
+			case "create": {
+				const dataSourceId = asString(r.data_source_id, "data_source_id");
+				const name = asString(r.name, "name");
+				const type = asString(r.type, "type") as ViewType;
+				const databaseId = asOptString(r.database_id, "database_id");
+				return createView(ctx.notion, {
+					database_id: databaseId,
+					data_source_id: dataSourceId,
+					name,
+					type,
+					filter: r.filter as Record<string, unknown> | undefined,
+					sorts: r.sorts as Array<Record<string, unknown>> | undefined,
+					quick_filters: r.quick_filters as
+						| Record<string, unknown>
+						| undefined,
+					configuration: r.configuration as
+						| Record<string, unknown>
+						| undefined,
+					position: r.position as Record<string, unknown> | undefined,
+				});
+			}
+			case "update": {
+				const viewId = asString(r.view_id, "view_id");
+				return updateView(ctx.notion, {
+					view_id: viewId,
+					name: asOptString(r.name, "name"),
+					filter: r.filter as Record<string, unknown> | undefined,
+					sorts: r.sorts as Array<Record<string, unknown>> | undefined,
+					quick_filters: r.quick_filters as
+						| Record<string, unknown>
+						| undefined,
+					configuration: r.configuration as
+						| Record<string, unknown>
+						| undefined,
+				});
+			}
+			case "list": {
+				const databaseId = asOptString(r.database_id, "database_id");
+				const dataSourceId = asOptString(r.data_source_id, "data_source_id");
+				if (!databaseId && !dataSourceId) {
+					throw new Error(
+						"manageView list: provide either database_id or data_source_id",
+					);
+				}
+				return {
+					views: await listViews(ctx.notion, {
+						database_id: databaseId,
+						data_source_id: dataSourceId,
+					}),
+				};
+			}
+			case "retrieve": {
+				const viewId = asString(r.view_id, "view_id");
+				return retrieveView(ctx.notion, viewId);
+			}
+			case "delete": {
+				const viewId = asString(r.view_id, "view_id");
+				await deleteView(ctx.notion, viewId);
+				return { ok: true };
+			}
+			case "addWidget": {
+				const dashboardViewId = asString(r.dashboard_view_id, "dashboard_view_id");
+				const dataSourceId = asString(r.data_source_id, "data_source_id");
+				const name = asString(r.name, "name");
+				const type = asString(r.type, "type") as ViewType;
+				return createView(ctx.notion, {
+					view_id: dashboardViewId,
+					data_source_id: dataSourceId,
+					name,
+					type,
+					filter: r.filter as Record<string, unknown> | undefined,
+					sorts: r.sorts as Array<Record<string, unknown>> | undefined,
+					configuration: r.configuration as
+						| Record<string, unknown>
+						| undefined,
+					placement: r.placement as Record<string, unknown> | undefined,
+				});
+			}
+			case "createLinkedDatabase": {
+				const targetPageId = asString(r.target_page_id, "target_page_id");
+				await auditIfExternal(
+					ctx,
+					"manageView",
+					targetPageId,
+					"op=createLinkedDatabase",
+				);
+				const dataSourceId = asString(r.data_source_id, "data_source_id");
+				const name = asString(r.name, "name");
+				const type = asString(r.type, "type") as ViewType;
+				return createView(ctx.notion, {
+					create_database: {
+						parent: { type: "page_id", page_id: targetPageId },
+					},
+					data_source_id: dataSourceId,
+					name,
+					type,
+					configuration: r.configuration as
+						| Record<string, unknown>
+						| undefined,
+				});
+			}
+			case "query": {
+				const viewId = asString(r.view_id, "view_id");
+				const pageSize = asOptNumber(r.page_size, "page_size");
+				const startCursor = asOptString(r.start_cursor, "start_cursor");
+				return queryView(ctx.notion, {
+					view_id: viewId,
+					page_size: pageSize,
+					start_cursor: startCursor,
+				});
+			}
+			default:
+				throw new Error(`manageView: unknown op "${op}"`);
+		}
+	},
+
+	async writePageMarkdown(input, ctx) {
+		const r = asRecord(input);
+		const pageId = asString(r.page_id, "page_id");
+		const mode = asString(r.mode, "mode");
+		await auditIfExternal(ctx, "writePageMarkdown", pageId, `mode=${mode}`);
+		await ctx.pacer.acquire();
+		const allowDelete =
+			typeof r.allow_deleting_content === "boolean"
+				? r.allow_deleting_content
+				: false;
+		let body: Record<string, unknown>;
+		switch (mode) {
+			case "append": {
+				const content = asString(r.content, "content");
+				const after = asOptString(r.after, "after");
+				body = {
+					type: "insert_content",
+					insert_content: { content, after },
+				};
+				break;
+			}
+			case "replace": {
+				const content = asString(r.content, "content");
+				body = {
+					type: "replace_content",
+					replace_content: {
+						new_str: content,
+						allow_deleting_content: allowDelete,
+					},
+				};
+				break;
+			}
+			case "replace_range": {
+				const content = asString(r.content, "content");
+				const contentRange = asString(r.content_range, "content_range");
+				body = {
+					type: "replace_content_range",
+					replace_content_range: {
+						content,
+						content_range: contentRange,
+						allow_deleting_content: allowDelete,
+					},
+				};
+				break;
+			}
+			case "update": {
+				if (!Array.isArray(r.updates)) {
+					throw new Error("writePageMarkdown: update mode requires `updates` array");
+				}
+				const updates = r.updates.map((u, i) => {
+					const rec = asRecord(u);
+					return {
+						old_str: asString(rec.old_str, `updates[${i}].old_str`),
+						new_str: asString(rec.new_str, `updates[${i}].new_str`),
+						replace_all_matches:
+							typeof rec.replace_all_matches === "boolean"
+								? rec.replace_all_matches
+								: undefined,
+					};
+				});
+				body = {
+					type: "update_content",
+					update_content: {
+						content_updates: updates,
+						allow_deleting_content: allowDelete,
+					},
+				};
+				break;
+			}
+			default:
+				throw new Error(`writePageMarkdown: unknown mode "${mode}"`);
+		}
+		await (ctx.notion.pages.updateMarkdown as unknown as (a: unknown) => Promise<unknown>)(
+			{
+				page_id: pageId,
+				...body,
+			},
+		);
+		return { ok: true };
+	},
 };
+
+interface DelegationResult {
+	summary: string;
+	tool_calls: number;
+	turns: number;
+	tokens: number;
+	duration_ms: number;
+}
+
+const SUB_AGENT_EMOJI: Record<AgentName, string> = {
+	Architect: "🧠",
+	Scout: "🔍",
+	Librarian: "📚",
+	Oracle: "🔮",
+	Forge: "🔨",
+	Scribe: "✍️",
+	Sentinel: "🛡️",
+};
+
+function formatTokensCompact(n: number): string {
+	if (n < 1000) return String(n);
+	return `${(n / 1000).toFixed(1)}k`;
+}
+
+function formatDurationCompact(ms: number): string {
+	if (ms < 1000) return `${ms}ms`;
+	if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+	return `${(ms / 60_000).toFixed(1)}m`;
+}
+
+async function runDelegation(
+	parentCtx: ToolHandlerContext,
+	subAgent: AgentName,
+	spec: {
+		model: string;
+		systemPrompt: string;
+		stepBudget: number;
+		taskBudgetTokens: number;
+		thinking?: { type: "enabled"; budget_tokens: number };
+	},
+	query: string,
+	context: string | undefined,
+): Promise<DelegationResult> {
+	const subTools = getToolsForAgent(subAgent);
+
+	const subCtx: ToolHandlerContext = {
+		...parentCtx,
+		agentName: subAgent,
+		doneSummary: undefined,
+		verdict: undefined,
+	};
+
+	const initialUserMessage = context
+		? `Query: ${query}\n\nContext: ${context}`
+		: `Query: ${query}`;
+
+	const runsDsId = parentCtx.projectIds.dbs.runs?.dsId;
+	const runAgentName = subAgent as RunAgent;
+	const workspaceIds = getWorkspaceHomeIdsFromEnv();
+	const tokensBefore = parentCtx.tokenBudget.usage;
+	const tStart = Date.now();
+
+	const runIds = runsDsId
+		? await startRun({
+				notion: parentCtx.notion,
+				pacer: parentCtx.pacer,
+				dsId: runsDsId,
+				agent: runAgentName,
+				label: `${SUB_AGENT_EMOJI[subAgent] ?? "•"} ${subAgent}: ${query.slice(0, 80)}${query.length > 80 ? "…" : ""}`,
+				mirror: workspaceIds
+					? {
+							activityDsId: workspaceIds.activityDsId,
+							briefUrl: briefUrlFor(parentCtx.briefMetadata.id),
+							briefTitle: parentCtx.briefMetadata.title,
+						}
+					: undefined,
+			}).catch((err: unknown) => {
+				console.warn("[handlers] startRun failed:", err);
+				return undefined;
+			})
+		: undefined;
+
+	try {
+		const result = await runAgent({
+			systemPrompt: spec.systemPrompt,
+			initialUserMessage,
+			tools: subTools,
+			dispatcher: subDispatcherSingleton(),
+			ctx: subCtx,
+			model: spec.model,
+			stepBudget: spec.stepBudget,
+			taskBudgetTokens: spec.taskBudgetTokens,
+			thinking: spec.thinking,
+		});
+
+		const summary =
+			(subCtx.doneSummary && subCtx.doneSummary.trim()) ||
+			result.finalText.trim() ||
+			`(${subAgent} returned no summary — see Sources for findings)`;
+		const tokensDelta = parentCtx.tokenBudget.usage - tokensBefore;
+		const durationMs = Date.now() - tStart;
+
+		if (runIds) {
+			await finishRun({
+				notion: parentCtx.notion,
+				pacer: parentCtx.pacer,
+				runRowId: runIds.runRowId,
+				activityRowId: runIds.activityRowId,
+				durationMs,
+				tokens: tokensDelta,
+				toolCalls: result.toolCallsConsumed,
+				summary,
+				verdict: subCtx.verdict?.verdict,
+			});
+		}
+
+		await logSubDelegation(parentCtx, {
+			subAgent,
+			query,
+			summary,
+			toolCalls: result.toolCallsConsumed,
+			tokens: tokensDelta,
+			durationMs,
+		});
+
+		return {
+			summary,
+			tool_calls: result.toolCallsConsumed,
+			turns: result.turns,
+			tokens: tokensDelta,
+			duration_ms: durationMs,
+		};
+	} catch (err) {
+		const tokensDelta = parentCtx.tokenBudget.usage - tokensBefore;
+		const durationMs = Date.now() - tStart;
+		if (runIds) {
+			await failRun({
+				notion: parentCtx.notion,
+				pacer: parentCtx.pacer,
+				runRowId: runIds.runRowId,
+				activityRowId: runIds.activityRowId,
+				durationMs,
+				tokens: tokensDelta,
+				errorMsg: err instanceof Error ? err.message : String(err),
+			});
+		}
+		throw err;
+	}
+}
+
+async function logSubDelegation(
+	parentCtx: ToolHandlerContext,
+	args: {
+		subAgent: AgentName;
+		query: string;
+		summary: string;
+		toolCalls: number;
+		tokens: number;
+		durationMs: number;
+	},
+): Promise<void> {
+	const activityPageId = parentCtx.projectIds.activityPageId;
+	if (!activityPageId) return;
+	const emoji = SUB_AGENT_EMOJI[args.subAgent] ?? "•";
+	const headline = `${emoji} ${args.subAgent} → "${args.query.slice(0, 80)}${args.query.length > 80 ? "…" : ""}" · ${args.toolCalls} tools · ${formatDurationCompact(args.durationMs)} · ${formatTokensCompact(args.tokens)} tokens`;
+	const children: BlockObjectRequest[] = [paragraph(args.summary)];
+	try {
+		await parentCtx.pacer.acquire();
+		await parentCtx.notion.blocks.children.append({
+			block_id: activityPageId,
+			children: [toggle(headline, children)],
+		});
+	} catch (err) {
+		console.warn(
+			`[handlers] logSubDelegation(${args.subAgent}) failed:`,
+			err,
+		);
+	}
+}
 
 class HivemindToolDispatcher implements ToolDispatcher {
 	async dispatch(

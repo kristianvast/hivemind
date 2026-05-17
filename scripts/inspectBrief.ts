@@ -1,5 +1,7 @@
 import { Client } from "@notionhq/client";
 
+import { readHivemindState } from "../src/state";
+
 interface BlockResult {
 	type: string;
 	[key: string]: unknown;
@@ -74,11 +76,7 @@ async function main(): Promise<void> {
 	console.log(`Category: ${category}`);
 	console.log(`Project:  ${projectUrl ?? "(unset)"}`);
 
-	const stateRaw =
-		props["Hivemind State"]?.type === "rich_text"
-			? props["Hivemind State"].rich_text.map((r) => r.plain_text).join("")
-			: null;
-	const state = stateRaw ? JSON.parse(stateRaw) : {};
+	const state = await readHivemindState(notion, briefId);
 
 	const draftsDsId = state.dsIds?.drafts?.dsId;
 	if (draftsDsId) {

@@ -6,6 +6,7 @@ const DONE_TOOL_NAME = "done";
 
 const TOOL_RESULT_CHAR_CAP = 8000;
 const CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27";
+const TASK_BUDGETS_BETA = "task-budgets-2026-03-13";
 
 const CONTEXT_MGMT_DEFAULTS = {
 	clearTriggerInputTokens: 30_000,
@@ -15,6 +16,10 @@ const CONTEXT_MGMT_DEFAULTS = {
 };
 
 const TASK_BUDGET_MIN = 20_000;
+
+function modelSupportsTaskBudget(model: string): boolean {
+	return /opus-4-(7|[89]|[1-9][0-9])/.test(model);
+}
 
 type BetaTextBlockParam = Anthropic.Beta.Messages.BetaTextBlockParam;
 type BetaToolUnion = Anthropic.Beta.Messages.BetaToolUnion;
@@ -34,9 +39,9 @@ export interface AgentContext {
 	notion: import("@notionhq/client").Client;
 	briefId: string;
 	projectRootId: string;
-	agentName: "Scout" | "Forge" | "Scribe" | "Sentinel";
+	agentName: "Architect" | "Scout" | "Librarian" | "Oracle" | "Forge" | "Scribe" | "Sentinel";
 	scopeGuard: {
-		assertAllowed(pageId: string): Promise<void>;
+		assertAllowed(pageId: string): Promise<unknown>;
 		registerCreated(pageId: string): void;
 	};
 	tokenBudget: {
@@ -53,7 +58,7 @@ export interface ToolDispatcher {
 export interface RunAgentOptions {
 	systemPrompt: string;
 	initialUserMessage: string;
-	tools: Anthropic.Tool[];
+	tools: BetaToolUnion[];
 	dispatcher: ToolDispatcher;
 	ctx: AgentContext;
 	model: string;
@@ -98,7 +103,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
 	const cachedSystem = buildCachedSystem(opts.systemPrompt);
 	const cachedTools = buildCachedTools(opts.tools);
 	const contextManagement = buildContextManagement(opts.tools);
-	const taskBudget = buildTaskBudget(opts.taskBudgetTokens);
+	const taskBudget = modelSupportsTaskBudget(opts.model)
+		? buildTaskBudget(opts.taskBudgetTokens)
+		: undefined;
+	const betas: string[] = [CONTEXT_MANAGEMENT_BETA];
+	if (taskBudget) betas.push(TASK_BUDGETS_BETA);
 
 	let toolCallsConsumed = 0;
 	let turns = 0;
@@ -115,7 +124,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
 			system: cachedSystem,
 			tools: cachedTools,
 			messages,
-			betas: [CONTEXT_MANAGEMENT_BETA],
+			betas,
 			context_management: contextManagement,
 		};
 		if (opts.thinking) {
@@ -172,6 +181,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentResult> {
 			);
 		}
 
+		if (stopReason === "pause_turn") {
+			// Long server-tool sequence (web_search / web_fetch) interrupted by
+			// the API's per-turn output cap. Resend the same conversation —
+			// the assistant message is already pushed — and let Claude continue
+			// where it left off. No client tool_use to dispatch this turn.
+			continue;
+		}
+
 		if (stopReason !== "tool_use") {
 			if (stopReason === "model_context_window_exceeded") {
 				throw new Error(
@@ -215,20 +232,24 @@ function buildCachedSystem(systemPrompt: string): BetaTextBlockParam[] {
 	];
 }
 
-function buildCachedTools(tools: Anthropic.Tool[]): BetaToolUnion[] {
+function buildCachedTools(tools: BetaToolUnion[]): BetaToolUnion[] {
 	if (tools.length === 0) return [];
 	const last = tools.length - 1;
 	return tools.map((tool, i) =>
 		i === last
 			? ({ ...tool, cache_control: { type: "ephemeral" } } as BetaToolUnion)
-			: (tool as BetaToolUnion),
+			: tool,
 	);
 }
 
 function buildContextManagement(
-	tools: Anthropic.Tool[],
+	tools: BetaToolUnion[],
 ): BetaContextManagementConfig {
-	const toolNames = new Set(tools.map((t) => t.name));
+	const toolNames = new Set(
+		tools.map((t) => ("name" in t ? t.name : undefined)).filter(
+			(n): n is string => typeof n === "string",
+		),
+	);
 	const exclude = CONTEXT_MGMT_DEFAULTS.alwaysPreserveTools.filter((n) =>
 		toolNames.has(n),
 	);
@@ -336,6 +357,31 @@ function toMessageContent(blocks: BetaContentBlock[]): BetaContentBlockParam[] {
 		}
 		if (block.type === "redacted_thinking") {
 			out.push({ type: "redacted_thinking", data: block.data });
+			continue;
+		}
+		if (block.type === "server_tool_use") {
+			out.push({
+				type: "server_tool_use",
+				id: block.id,
+				name: block.name,
+				input: block.input,
+			});
+			continue;
+		}
+		if (block.type === "web_search_tool_result") {
+			out.push({
+				type: "web_search_tool_result",
+				tool_use_id: block.tool_use_id,
+				content: block.content,
+			});
+			continue;
+		}
+		if (block.type === "web_fetch_tool_result") {
+			out.push({
+				type: "web_fetch_tool_result",
+				tool_use_id: block.tool_use_id,
+				content: block.content,
+			});
 			continue;
 		}
 	}

@@ -1,28 +1,31 @@
 // Per-brief project subtree provisioner.
 //
-// Layout depends on Category:
+// Unified layout (Phase 4 — single shape for every brief, regardless of
+// Category):
 //
-// "writing" / "quick" (single-shot prose answers, no iteration):
-//   📁 {briefTitle}              (root page — Scribe/Forge writes the answer here)
-//   ├── 📄 Answer                (heading_2 on root, anchor for writeAnswer)
-//   ├── …answer content…         (inserted between anchor and child pages below)
-//   ├── …Sentinel review…        (appended inline after content)
-//   ├── Plan                     (child page — writing only; Scout's context)
-//   └── Activity                 (child page — chronological agent run log)
-//
-// "deep" / "ultrabrain" / "visual-engineering" (iterative work, needs revision history):
 //   📁 {briefTitle}              (root page)
+//   ├── 📄 Answer                (heading_2 — anchor for writeAnswer)
+//   ├── …answer content…         (only present if the Architect chose writeAnswer)
 //   ├── Plan                     (child page — Context/Approach/Decisions/Sources/Open Questions/Status)
-//   ├── Drafts                   (database — iterating artifacts; reviews are appended inline on each draft page)
+//   ├── Drafts                   (database — iterating artifacts; empty if Architect chose writeAnswer)
+//   ├── Sources                  (database — captured external references)
+//   ├── Decisions                (database — recorded architectural choices)
+//   ├── Open Questions           (database — blockers / human-input requests)
 //   └── Activity                 (child page — chronological agent run log)
 //
-// Ordering trick for writing/quick: the Answer heading is created BEFORE Plan
-// and Activity child pages so it appears at the top of the root page. writeAnswer
-// then uses Notion's `after` insert parameter to slot content between the anchor
-// heading and the child_page navigation blocks below.
+// The Architect picks writeAnswer (inline prose) vs createDraft (iterative
+// artifact) at runtime. Both shapes are provisioned eagerly so the choice
+// is purely a tool call away. Whichever shape isn't used stays empty.
 //
-// Idempotency: walk-by-name on every step; state persisted after root creation
-// and after every step, so partial failures recover cleanly.
+// Ordering trick: the Answer heading is created BEFORE the Plan / Drafts /
+// Activity child blocks so it sits at the top of the root. writeAnswer
+// then uses Notion's `after` insert parameter to slot content between the
+// anchor heading and the child_page navigation blocks below.
+//
+// Idempotency: walk-by-name on every step; state persisted after root
+// creation and after every step, so partial failures recover cleanly. The
+// `category` parameter is informational metadata only — it drives the
+// project icon and dashboard caption, never the layout.
 
 import type { Client } from "@notionhq/client";
 import { isFullDatabase, isFullPage } from "@notionhq/client";
@@ -45,6 +48,11 @@ import {
 	todoBlock,
 	toggle,
 } from "./notion";
+import {
+	ensureRunsDatabase,
+	ensureRunsViews,
+	RUNS_DB_TITLE,
+} from "./runs";
 import { readHivemindState, writeHivemindState } from "./state";
 import type { DbIds, HivemindState } from "./state";
 
@@ -54,20 +62,28 @@ const PROJECT_URL_PROP = "📁 Project";
 
 const ANSWER_ANCHOR_TEXT = "📄 Answer";
 
-export function usesDraftsDb(category: Category): boolean {
-	return category !== "writing" && category !== "quick";
-}
-
+/**
+ * Post-provision shape. Every field is non-nullable because the unified
+ * Phase 4 layout always provisions every artifact. Old briefs that were
+ * provisioned under the v1/v2-pre-Phase-4 shape are healed on the next
+ * provisionProject() call (idempotent), filling in any missing pieces.
+ *
+ * Phase 6 adds `runs` — the per-brief Runs database that captures one row
+ * per agent invocation for observability. Optional in `ProjectIds` while
+ * Phase 6 rolls out so existing briefs without a Runs DB don't 500; once
+ * baked the field becomes required.
+ */
 export interface ProjectIds {
 	projectRootId: string;
-	planPageId: string | null;
+	planPageId: string;
 	activityPageId: string;
-	answerAnchorBlockId?: string;
+	answerAnchorBlockId: string;
 	dbs: {
-		drafts?: DbIds;
-		sources?: DbIds;
-		decisions?: DbIds;
-		openQuestions?: DbIds;
+		drafts: DbIds;
+		sources: DbIds;
+		decisions: DbIds;
+		openQuestions: DbIds;
+		runs?: DbIds;
 	};
 }
 
@@ -89,7 +105,9 @@ const ROOT_OPEN_QUESTIONS_VIEW_TITLE = "❓ Open questions";
 const ROOT_LATEST_DECISIONS_VIEW_TITLE = "✅ Latest decisions";
 const ROOT_SOURCES_VIEW_TITLE = "🔎 Sources";
 
-function projectIcon(category: Category): NonNullable<CreatePageParameters["icon"]> {
+function projectIcon(
+	category: Category | undefined,
+): NonNullable<CreatePageParameters["icon"]> {
 	const emoji =
 		category === "visual-engineering"
 			? "🎨"
@@ -133,31 +151,30 @@ const PLAN_PAGE_CHILDREN: NonNullable<CreatePageParameters["children"]> = [
 	divider(),
 	heading2("Context"),
 	callout("What matters about the brief, audience, constraints, and success criteria.", "🎯", "gray_background"),
-	toggle("Research details", [paragraph("_Pending Scout output_")]),
+	toggle("Research details", [paragraph("_Pending research_")]),
 	heading2("Approach"),
 	callout("Recommended path through the work, kept concise enough for a human reviewer to scan.", "🛠️", "gray_background"),
-	toggle("Assumptions and rejected paths", [paragraph("_Pending Scout output_")]),
+	toggle("Assumptions and rejected paths", [paragraph("_Pending Architect_")]),
 	heading2("Decisions"),
 	callout("Significant choices made by the swarm, with rationale.", "✅", "green_background"),
-	paragraph("_Pending agents_"),
+	paragraph("_Pending Architect_"),
 	heading2("Sources"),
 	callout("Evidence and references the agents relied on.", "🔎", "yellow_background"),
-	paragraph("_Pending Scout output_"),
+	paragraph("_Pending research_"),
 	heading2("Open Questions"),
 	callout("Human input needed, unresolved risks, or follow-up opportunities.", "❓", "orange_background"),
 	paragraph("_Pending agents_"),
 	heading2("Status"),
 	callout("Current chain state, latest verdict, and next action.", "📍", "purple_background"),
-	todoBlock("Scout context captured", false),
-	todoBlock("Draft created", false),
+	todoBlock("Context captured", false),
+	todoBlock("Deliverable produced", false),
 	todoBlock("Sentinel review complete", false),
 ];
 
-function rootDashboardChildren(category: Category): NonNullable<CreatePageParameters["children"]> {
-	const inlineAnswer = !usesDraftsDb(category);
-	const deliverable = inlineAnswer
-		? "Final answer appears directly under the Answer section on this page."
-		: "Draft iterations live in the Drafts database. The approved draft is the deliverable.";
+function rootDashboardChildren(
+	category: Category | undefined,
+): NonNullable<CreatePageParameters["children"]> {
+	const categoryLine = category ? `Category: ${category}` : "Category: (unset)";
 	return [
 		heading1("Hivemind workspace"),
 		callout(
@@ -171,14 +188,16 @@ function rootDashboardChildren(category: Category): NonNullable<CreatePageParame
 				children: [
 					heading3("Status"),
 					paragraph("Provisioned"),
-					paragraph(`Category: ${category}`),
+					paragraph(categoryLine),
 				],
 			},
 			{
 				widthRatio: 0.33,
 				children: [
 					heading3("Deliverable"),
-					paragraph(deliverable),
+					paragraph(
+						"Either inline under the 📄 Answer section above, or as a row in the Drafts database — whichever shape the Architect picks at runtime.",
+					),
 				],
 			},
 			{
@@ -216,6 +235,7 @@ const DRAFTS_DB_PROPERTIES: DbPropertiesRequest = {
 		type: "select",
 		select: {
 			options: [
+				{ name: "Architect", color: "blue" },
 				{ name: "Forge", color: "orange" },
 				{ name: "Scribe", color: "purple" },
 			],
@@ -277,9 +297,10 @@ const SOURCES_DB_PROPERTIES: DbPropertiesRequest = {
 		type: "select",
 		select: {
 			options: [
+				{ name: "Architect", color: "blue" },
 				{ name: "Scout", color: "blue" },
-				{ name: "Forge", color: "orange" },
-				{ name: "Scribe", color: "purple" },
+				{ name: "Librarian", color: "purple" },
+				{ name: "Oracle", color: "pink" },
 				{ name: "Sentinel", color: "green" },
 			],
 		},
@@ -296,9 +317,10 @@ const DECISIONS_DB_PROPERTIES: DbPropertiesRequest = {
 		type: "select",
 		select: {
 			options: [
+				{ name: "Architect", color: "blue" },
 				{ name: "Scout", color: "blue" },
-				{ name: "Forge", color: "orange" },
-				{ name: "Scribe", color: "purple" },
+				{ name: "Librarian", color: "purple" },
+				{ name: "Oracle", color: "pink" },
 				{ name: "Sentinel", color: "green" },
 				{ name: "Human", color: "gray" },
 			],
@@ -324,9 +346,10 @@ const OPEN_QUESTIONS_DB_PROPERTIES: DbPropertiesRequest = {
 		type: "select",
 		select: {
 			options: [
+				{ name: "Architect", color: "blue" },
 				{ name: "Scout", color: "blue" },
-				{ name: "Forge", color: "orange" },
-				{ name: "Scribe", color: "purple" },
+				{ name: "Librarian", color: "purple" },
+				{ name: "Oracle", color: "pink" },
 				{ name: "Sentinel", color: "green" },
 			],
 		},
@@ -536,44 +559,36 @@ async function enrichProjectDashboard(
 	notion: Client,
 	rootId: string,
 	dbs: {
-		drafts?: DbIds;
-		sources?: DbIds;
-		decisions?: DbIds;
-		openQuestions?: DbIds;
+		drafts: DbIds;
+		sources: DbIds;
+		decisions: DbIds;
+		openQuestions: DbIds;
 	},
 ): Promise<void> {
 	try {
 		const scan = await scanRootChildren(notion, rootId);
-		if (dbs.drafts) {
-			await enrichDraftViews(notion, dbs.drafts);
-			await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_APPROVED_VIEW_TITLE, "table", {
-				filter: { property: "Status", select: { equals: "approved" } },
-				sorts: [{ property: "Approved At", direction: "descending" }],
-			});
-			await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_LATEST_VIEW_TITLE, "table", {
-				sorts: [{ property: "Iteration", direction: "descending" }],
-			});
-			await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_NEEDS_REVIEW_VIEW_TITLE, "table", {
-				filter: { property: "Status", select: { equals: ["in-review", "needs-revision"] } },
-				sorts: [{ property: "Iteration", direction: "descending" }],
-			});
-		}
-		if (dbs.openQuestions) {
-			await ensureLinkedView(notion, rootId, scan, dbs.openQuestions.dsId, ROOT_OPEN_QUESTIONS_VIEW_TITLE, "table", {
-				filter: { property: "Status", select: { equals: "open" } },
-				sorts: [{ property: "Asked At", direction: "descending" }],
-			});
-		}
-		if (dbs.decisions) {
-			await ensureLinkedView(notion, rootId, scan, dbs.decisions.dsId, ROOT_LATEST_DECISIONS_VIEW_TITLE, "table", {
-				sorts: [{ property: "Made At", direction: "descending" }],
-			});
-		}
-		if (dbs.sources) {
-			await ensureLinkedView(notion, rootId, scan, dbs.sources.dsId, ROOT_SOURCES_VIEW_TITLE, "table", {
-				sorts: [{ property: "Captured At", direction: "descending" }],
-			});
-		}
+		await enrichDraftViews(notion, dbs.drafts);
+		await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_APPROVED_VIEW_TITLE, "table", {
+			filter: { property: "Status", select: { equals: "approved" } },
+			sorts: [{ property: "Approved At", direction: "descending" }],
+		});
+		await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_LATEST_VIEW_TITLE, "table", {
+			sorts: [{ property: "Iteration", direction: "descending" }],
+		});
+		await ensureLinkedView(notion, rootId, scan, dbs.drafts.dsId, ROOT_NEEDS_REVIEW_VIEW_TITLE, "table", {
+			filter: { property: "Status", select: { equals: ["in-review", "needs-revision"] } },
+			sorts: [{ property: "Iteration", direction: "descending" }],
+		});
+		await ensureLinkedView(notion, rootId, scan, dbs.openQuestions.dsId, ROOT_OPEN_QUESTIONS_VIEW_TITLE, "table", {
+			filter: { property: "Status", select: { equals: "open" } },
+			sorts: [{ property: "Asked At", direction: "descending" }],
+		});
+		await ensureLinkedView(notion, rootId, scan, dbs.decisions.dsId, ROOT_LATEST_DECISIONS_VIEW_TITLE, "table", {
+			sorts: [{ property: "Made At", direction: "descending" }],
+		});
+		await ensureLinkedView(notion, rootId, scan, dbs.sources.dsId, ROOT_SOURCES_VIEW_TITLE, "table", {
+			sorts: [{ property: "Captured At", direction: "descending" }],
+		});
 	} catch (err) {
 		console.warn("[provision] dashboard/view enrichment skipped:", err);
 	}
@@ -583,7 +598,7 @@ async function createRootPage(
 	notion: Client,
 	briefId: string,
 	briefTitle: string,
-	category: Category,
+	category: Category | undefined,
 ): Promise<string> {
 	const res = await notion.pages.create({
 		parent: { type: "page_id", page_id: briefId },
@@ -657,21 +672,24 @@ async function findOrCreateAnswerAnchor(
  *
  * Idempotent: safe to call multiple times. On retry it walks the root page's
  * children, reuses anything that already exists by name, and only creates
- * what's missing.
+ * what's missing. Briefs provisioned under earlier (category-bifurcated)
+ * shapes are healed on the next call — anything missing gets backfilled so
+ * the Architect always sees the unified layout.
  *
  * Rate limiting: the @notionhq/client SDK retries 429s automatically with
  * exponential back-off and Retry-After awareness (RetryOptions defaults to
  * `maxRetries: 2`), so we don't add a second retry layer here.
+ *
+ * The `category` parameter is informational metadata only — it drives the
+ * project icon and dashboard caption, never the layout.
  */
 export async function provisionProject(
 	notion: Client,
 	briefId: string,
 	briefTitle: string,
-	category: Category,
+	category: Category | undefined,
 ): Promise<ProjectIds> {
 	let state = await readHivemindState(notion, briefId);
-	const inlineAnswer = !usesDraftsDb(category);
-	const needsPlan = category !== "quick";
 
 	let projectRootId = state.projectRootId;
 	if (!projectRootId) {
@@ -688,7 +706,7 @@ export async function provisionProject(
 	// sits at the top of the root, with all child_page blocks below. This is
 	// the only way to get a stable insertion point for writeAnswer.
 	let answerAnchorBlockId = state.answerAnchorBlockId;
-	if (inlineAnswer && !answerAnchorBlockId) {
+	if (!answerAnchorBlockId) {
 		answerAnchorBlockId = await findOrCreateAnswerAnchor(notion, projectRootId);
 		state = { ...state, answerAnchorBlockId };
 		await writeHivemindState(notion, briefId, state);
@@ -698,30 +716,28 @@ export async function provisionProject(
 
 	let planPageId =
 		state.planPageId ?? scan.childPagesByTitle.get(PLAN_PAGE_TITLE);
-	if (needsPlan) {
-		if (!planPageId) {
-			planPageId = await createChildPage(
-				notion,
-				projectRootId,
-				PLAN_PAGE_TITLE,
-				PLAN_PAGE_CHILDREN,
-			);
-		} else if (!state.planPageId) {
-			// Recovered Plan page from a prior run that crashed before persisting
-			// state. If its body is empty, backfill the structured sections so the
-			// agents' set_plan_section tool has somewhere to land.
-			try {
-				const children = await notion.blocks.children.list({
-					block_id: planPageId,
-					page_size: 1,
-				});
-				if (children.results.length === 0) {
-					await appendBlocks(notion, planPageId, PLAN_PAGE_CHILDREN);
-				}
-			} catch {
-				// Non-fatal: the Plan page exists; sections will be created on
-				// first set_plan_section call by an agent.
+	if (!planPageId) {
+		planPageId = await createChildPage(
+			notion,
+			projectRootId,
+			PLAN_PAGE_TITLE,
+			PLAN_PAGE_CHILDREN,
+		);
+	} else if (!state.planPageId) {
+		// Recovered Plan page from a prior run that crashed before persisting
+		// state. If its body is empty, backfill the structured sections so the
+		// agents' setPlanSection tool has somewhere to land.
+		try {
+			const children = await notion.blocks.children.list({
+				block_id: planPageId,
+				page_size: 1,
+			});
+			if (children.results.length === 0) {
+				await appendBlocks(notion, planPageId, PLAN_PAGE_CHILDREN);
 			}
+		} catch {
+			// Non-fatal: the Plan page exists; sections will be created on
+			// first setPlanSection call by an agent.
 		}
 	}
 
@@ -737,7 +753,7 @@ export async function provisionProject(
 	}
 
 	let draftsIds: DbIds | undefined = state.dsIds?.drafts;
-	if (usesDraftsDb(category) && !draftsIds) {
+	if (!draftsIds) {
 		const existingDbId = scan.childDbsByTitle.get(DRAFTS_DB_TITLE);
 		if (existingDbId) {
 			const dsId = await resolveDsId(notion, existingDbId);
@@ -748,68 +764,75 @@ export async function provisionProject(
 	}
 
 	let sourcesIds: DbIds | undefined = state.dsIds?.sources;
+	if (!sourcesIds) {
+		sourcesIds = await findOrCreateProjectDatabase(
+			notion,
+			projectRootId,
+			scan,
+			SOURCES_DB_TITLE,
+			SOURCES_DB_PROPERTIES,
+		);
+	}
+
 	let decisionsIds: DbIds | undefined = state.dsIds?.decisions;
+	if (!decisionsIds) {
+		decisionsIds = await findOrCreateProjectDatabase(
+			notion,
+			projectRootId,
+			scan,
+			DECISIONS_DB_TITLE,
+			DECISIONS_DB_PROPERTIES,
+		);
+	}
+
 	let openQuestionsIds: DbIds | undefined = state.dsIds?.openQuestions;
-	if (needsPlan) {
-		if (!sourcesIds) {
-			sourcesIds = await findOrCreateProjectDatabase(
-				notion,
-				projectRootId,
-				scan,
-				SOURCES_DB_TITLE,
-				SOURCES_DB_PROPERTIES,
-			);
-		}
-		if (!decisionsIds) {
-			decisionsIds = await findOrCreateProjectDatabase(
-				notion,
-				projectRootId,
-				scan,
-				DECISIONS_DB_TITLE,
-				DECISIONS_DB_PROPERTIES,
-			);
-		}
-		if (!openQuestionsIds) {
-			openQuestionsIds = await findOrCreateProjectDatabase(
-				notion,
-				projectRootId,
-				scan,
-				OPEN_QUESTIONS_DB_TITLE,
-				OPEN_QUESTIONS_DB_PROPERTIES,
-			);
-		}
+	if (!openQuestionsIds) {
+		openQuestionsIds = await findOrCreateProjectDatabase(
+			notion,
+			projectRootId,
+			scan,
+			OPEN_QUESTIONS_DB_TITLE,
+			OPEN_QUESTIONS_DB_PROPERTIES,
+		);
+	}
+
+	let runsIds: DbIds | undefined = state.dsIds?.runs;
+	if (!runsIds) {
+		runsIds = await ensureRunsDatabase({
+			notion,
+			projectRootId,
+			existingChildDbId: scan.childDbsByTitle.get(RUNS_DB_TITLE),
+		});
 	}
 
 	state = {
 		...state,
 		projectRootId,
-		planPageId: planPageId ?? state.planPageId,
+		planPageId,
 		activityPageId,
 		answerAnchorBlockId,
 		dsIds: {
-			...state.dsIds,
-			...(draftsIds ? { drafts: draftsIds } : {}),
-			...(sourcesIds ? { sources: sourcesIds } : {}),
-			...(decisionsIds ? { decisions: decisionsIds } : {}),
-			...(openQuestionsIds ? { openQuestions: openQuestionsIds } : {}),
+			drafts: draftsIds,
+			sources: sourcesIds,
+			decisions: decisionsIds,
+			openQuestions: openQuestionsIds,
+			runs: runsIds,
 		},
 	};
 	await writeHivemindState(notion, briefId, state);
 
-	if (draftsIds) {
-		await notion.dataSources.update({
-			data_source_id: draftsIds.dsId,
-			properties: {
-				...DRAFTS_DB_ENRICHMENT_PROPERTIES,
-				"Based On Draft": {
-					relation: {
-						data_source_id: draftsIds.dsId,
-						single_property: {},
-					},
+	await notion.dataSources.update({
+		data_source_id: draftsIds.dsId,
+		properties: {
+			...DRAFTS_DB_ENRICHMENT_PROPERTIES,
+			"Based On Draft": {
+				relation: {
+					data_source_id: draftsIds.dsId,
+					single_property: {},
 				},
 			},
-		});
-	}
+		},
+	});
 
 	await enrichProjectDashboard(notion, projectRootId, {
 		drafts: draftsIds,
@@ -818,19 +841,22 @@ export async function provisionProject(
 		openQuestions: openQuestionsIds,
 	});
 
+	await ensureRunsViews({ notion, runs: runsIds });
+
 	await writeProjectUrlToBrief(notion, briefId, projectRootId);
 
 	const persistedState: HivemindState = state;
 	return {
 		projectRootId: persistedState.projectRootId ?? projectRootId,
-		planPageId: planPageId ?? null,
+		planPageId,
 		activityPageId,
 		answerAnchorBlockId,
 		dbs: {
-			...(draftsIds ? { drafts: draftsIds } : {}),
-			...(sourcesIds ? { sources: sourcesIds } : {}),
-			...(decisionsIds ? { decisions: decisionsIds } : {}),
-			...(openQuestionsIds ? { openQuestions: openQuestionsIds } : {}),
+			drafts: draftsIds,
+			sources: sourcesIds,
+			decisions: decisionsIds,
+			openQuestions: openQuestionsIds,
+			runs: runsIds,
 		},
 	};
 }

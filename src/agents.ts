@@ -1,20 +1,19 @@
 import type { Client } from "@notionhq/client";
 
 import { runAgent, type AgentResult } from "./agentLoop";
-import { getAgentSpec, type AgentName } from "./chains";
-import { getToolsForAgent } from "./tools/registry";
-import { createDispatcher, type ToolHandlerContext, type BriefMetadata } from "./tools/handlers";
-import type { ProjectIds } from "./provision";
-import type { ScopeGuard } from "./scope";
-import type { Pacer } from "./pacer";
+import type { AgentSpec } from "./architect";
 import type { TokenBudget } from "./budget";
-import type { Category } from "./classify";
+import type { ProjectIds } from "./provision";
+import type { Pacer } from "./pacer";
+import type { ScopeGuard } from "./scope";
+import { createDispatcher, type BriefMetadata, type ToolHandlerContext } from "./tools/handlers";
+import { getToolsForAgent } from "./tools/registry";
 
+export type { AgentSpec };
 export type { BriefMetadata };
 
 export interface RunAgentArgs {
-	agent: AgentName;
-	category: Category;
+	spec: AgentSpec;
 	notion: Client;
 	briefMetadata: BriefMetadata;
 	projectIds: ProjectIds;
@@ -26,13 +25,12 @@ export interface RunAgentArgs {
 export interface RunAgentReturn {
 	result: AgentResult;
 	verdict?: { verdict: "approve" | "needs-revision"; summary: string };
+	doneSummary?: string;
 }
 
 const dispatcher = createDispatcher();
 
 export async function invokeAgent(args: RunAgentArgs): Promise<RunAgentReturn> {
-	const spec = getAgentSpec(args.category, args.agent);
-
 	const ctx: ToolHandlerContext = {
 		notion: args.notion,
 		briefId: args.briefMetadata.id,
@@ -42,22 +40,26 @@ export async function invokeAgent(args: RunAgentArgs): Promise<RunAgentReturn> {
 		scopeGuard: args.scopeGuard,
 		pacer: args.pacer,
 		tokenBudget: args.tokenBudget,
-		agentName: args.agent,
+		agentName: args.spec.name as ToolHandlerContext["agentName"],
 	};
+
+	const tools = getToolsForAgent(
+		args.spec.name as Parameters<typeof getToolsForAgent>[0],
+	);
 
 	const initialUserMessage = `Brief: ${args.briefMetadata.title}\n\nBody:\n${args.briefMetadata.body ?? "(no body)"}\n\nProject Root: ${args.projectIds.projectRootId}`;
 
 	const result = await runAgent({
-		systemPrompt: spec.systemPrompt,
+		systemPrompt: args.spec.systemPrompt,
 		initialUserMessage,
-		tools: getToolsForAgent(args.agent, args.category),
+		tools,
 		dispatcher,
 		ctx,
-		model: spec.model,
-		stepBudget: spec.stepBudget,
-		taskBudgetTokens: spec.taskBudgetTokens,
-		thinking: spec.thinking,
+		model: args.spec.model,
+		stepBudget: args.spec.stepBudget,
+		taskBudgetTokens: args.spec.taskBudgetTokens,
+		thinking: args.spec.thinking,
 	});
 
-	return { result, verdict: ctx.verdict };
+	return { result, verdict: ctx.verdict, doneSummary: ctx.doneSummary };
 }

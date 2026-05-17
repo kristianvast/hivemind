@@ -5,7 +5,7 @@ import { WebhookVerificationError, Worker } from "@notionhq/workers";
 import { j } from "@notionhq/workers/schema-builder";
 import Pusher from "pusher";
 
-import { handleBriefApproved, runChainForBrief } from "./chain";
+import { handleBriefApproved, runOrchestratorForBrief } from "./orchestrator";
 import { ALL_CATEGORIES, classifyBrief, type Category } from "./classify";
 import { getBriefContext } from "./notion";
 import { provisionProject } from "./provision";
@@ -102,7 +102,7 @@ worker.tool("classifyBrief", {
 worker.tool("provisionProject", {
 	title: "Provision Project Subtree",
 	description:
-		"Admin/QA: provision the Notion project subtree for a brief (idempotent). Layout depends on category — writing/quick get an inline answer page (no Drafts DB); others get the full Plan/Drafts/Activity layout. If category is omitted, it's read from the brief's Category property (defaults to 'deep').",
+		"Admin/QA: provision the Notion project subtree for a brief (idempotent). Phase 4: layout is unified — every brief gets Plan + Drafts DB + Answer anchor + mini-DBs + Activity, regardless of Category. The `category` argument is informational only (drives the project icon and dashboard caption). If omitted, it's read from the brief's Category property, defaulting to 'deep'.",
 	schema: j.object({
 		briefId: j.string(),
 		category: j.string().nullable(),
@@ -128,6 +128,31 @@ worker.tool("debugState", {
 	execute: async ({ briefId }, { notion }) => {
 		const state = await readHivemindState(notion, briefId);
 		return JSON.parse(JSON.stringify(state));
+	},
+});
+
+worker.tool("runOrchestrator", {
+	title: "Run Orchestrator (Admin)",
+	description:
+		"Admin/QA: invoke the v2 orchestrator directly on a brief, bypassing the webhook (no secret verification, no chain lock, no dedup). Use for local end-to-end testing via `ntn workers exec runOrchestrator --local`. Returns the brief's Status after the run.",
+	schema: j.object({
+		briefId: j.string(),
+	}),
+	execute: async ({ briefId }, { notion }) => {
+		const page = await notion.pages.retrieve({ page_id: briefId });
+		if (!isFullPage(page)) {
+			throw new Error(`Brief ${briefId} returned partial response`);
+		}
+		const brief = await getBriefContext(notion, page);
+		await runOrchestratorForBrief({ notion, brief, botUserId: undefined });
+		const after = await notion.pages.retrieve({ page_id: briefId });
+		const finalStatus =
+			isFullPage(after) &&
+			after.properties.Status?.type === "select" &&
+			after.properties.Status.select
+				? after.properties.Status.select.name
+				: null;
+		return { briefId, finalStatus };
 	},
 });
 
@@ -426,8 +451,8 @@ worker.webhook("onBriefStatusChange", {
 					continue;
 				}
 				try {
-					await runChainForBrief({ notion, brief, botUserId });
-					console.log("[onBriefStatusChange] chain complete for", pageId);
+					await runOrchestratorForBrief({ notion, brief, botUserId });
+					console.log("[onBriefStatusChange] orchestrator complete for", pageId);
 				} finally {
 					await mergeHivemindState(notion, pageId, {
 						lastDeliveryId: event.deliveryId,

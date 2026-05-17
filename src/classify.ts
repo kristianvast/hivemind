@@ -1,3 +1,10 @@
+// Phase 4: Category is informational metadata only. The orchestrator still
+// runs this classifier on Backlog→Triaged transitions to fill the brief's
+// Category property (used for kanban filters and the project root's icon /
+// caption), but it does NOT route execution. The Architect picks
+// writeAnswer vs createDraft itself based on the brief content — every
+// brief is provisioned with the unified layout, regardless of Category.
+
 import Anthropic from "@anthropic-ai/sdk";
 
 export type Category = "visual-engineering" | "ultrabrain" | "deep" | "quick" | "writing";

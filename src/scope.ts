@@ -1,11 +1,33 @@
+// Scope classifier — Phase 10 refactor.
+//
+// v2 had a hard scope guard: the Architect could only write inside the
+// brief's project subtree, and `assertAllowed` threw ScopeViolation on
+// anything else. v3 drops this gate (user decision V2) and replaces it
+// with classification + audit logging.
+//
+// The class is renamed semantically (ScopeGuard → still ScopeGuard for
+// backward-compatible imports) but its `assertAllowed` method no longer
+// throws. Callers check the returned classification and append an audit
+// row when the target is outside the subtree. The classification is
+// cached per-page-id so repeated writes don't re-walk the parent chain.
+
 import type { Client } from "@notionhq/client";
 
+export type TargetScope = "in-subtree" | "external";
+
+/**
+ * Retained for backward compatibility — callers that catch ScopeViolation
+ * should be updated to consume the new classifyTarget output. Never thrown
+ * by the v3 codebase; if you see it in a log, that's an old code path.
+ */
 export class ScopeViolation extends Error {
 	constructor(
 		public readonly pageId: string,
 		public readonly projectRootId: string,
 	) {
-		super(`Page ${pageId} is not within project ${projectRootId}`);
+		super(
+			`Page ${pageId} is not within project ${projectRootId}. This error type is preserved for v2 compatibility but should no longer be thrown.`,
+		);
 		this.name = "ScopeViolation";
 	}
 }
@@ -13,28 +35,48 @@ export class ScopeViolation extends Error {
 export class ScopeGuard {
 	private readonly sessionAllowed = new Set<string>();
 	private readonly ancestorCache = new Map<string, Set<string>>();
+	private readonly classificationCache = new Map<string, TargetScope>();
 
 	constructor(
 		private readonly notion: Client,
 		private readonly projectRootId: string,
 	) {
 		this.sessionAllowed.add(projectRootId);
+		this.classificationCache.set(projectRootId, "in-subtree");
 	}
 
 	registerCreated(pageId: string): void {
 		this.sessionAllowed.add(pageId);
+		this.classificationCache.set(pageId, "in-subtree");
 	}
 
-	async assertAllowed(pageId: string): Promise<void> {
-		if (this.sessionAllowed.has(pageId)) return;
+	/**
+	 * v2-compatible name. NO LONGER THROWS. Returns the classification so
+	 * callers can decide whether to audit the write. Existing call sites
+	 * that did `await ctx.scopeGuard.assertAllowed(id)` for the side
+	 * effect (throw on violation) keep compiling and simply lose the
+	 * gate — exactly the v3 intent.
+	 */
+	async assertAllowed(pageId: string): Promise<TargetScope> {
+		return this.classifyTarget(pageId);
+	}
 
-		const ancestors = await this.walkAncestors(pageId);
-		if (ancestors.has(this.projectRootId)) {
-			this.sessionAllowed.add(pageId);
-			return;
+	async classifyTarget(pageId: string): Promise<TargetScope> {
+		const cached = this.classificationCache.get(pageId);
+		if (cached !== undefined) return cached;
+
+		if (this.sessionAllowed.has(pageId)) {
+			this.classificationCache.set(pageId, "in-subtree");
+			return "in-subtree";
 		}
 
-		throw new ScopeViolation(pageId, this.projectRootId);
+		const ancestors = await this.walkAncestors(pageId);
+		const result: TargetScope = ancestors.has(this.projectRootId)
+			? "in-subtree"
+			: "external";
+		this.classificationCache.set(pageId, result);
+		if (result === "in-subtree") this.sessionAllowed.add(pageId);
+		return result;
 	}
 
 	private async walkAncestors(pageId: string): Promise<Set<string>> {
@@ -64,6 +106,7 @@ export class ScopeGuard {
 							type: string;
 							page_id?: string;
 							database_id?: string;
+							data_source_id?: string;
 							block_id?: string;
 						};
 					}

@@ -1,8 +1,15 @@
 import type Anthropic from "@anthropic-ai/sdk";
 
-import type { Category } from "../classify";
+type BetaToolUnion = Anthropic.Beta.Messages.BetaToolUnion;
 
-export type AgentName = "Scout" | "Forge" | "Scribe" | "Sentinel";
+export type AgentName =
+	| "Architect"
+	| "Scout"
+	| "Librarian"
+	| "Oracle"
+	| "Forge"
+	| "Scribe"
+	| "Sentinel";
 
 // ---------------------------------------------------------------------------
 // Shared sub-schemas
@@ -26,13 +33,61 @@ const BLOCK_SHAPE = {
 				"toggle",
 				"divider",
 				"bookmark",
+				"equation",
+				"embed",
+				"image",
+				"video",
+				"audio",
+				"pdf",
+				"file",
+				"link_to_page",
+				"table",
+				"breadcrumb",
+				"table_of_contents",
 			],
 		},
-		text: { type: "string" },
+		text: {
+			type: "string",
+			description:
+				"Primary text for the block. For `equation`, holds the LaTeX expression.",
+		},
 		checked: { type: "boolean" },
 		language: { type: "string" },
 		emoji: { type: "string" },
-		url: { type: "string" },
+		url: {
+			type: "string",
+			description:
+				"For `bookmark`/`embed`: the target URL. For `image`/`video`/`audio`/`pdf`/`file`: the external file URL (alternative to `file_upload_id`).",
+		},
+		caption: {
+			type: "string",
+			description:
+				"Optional caption text for `image`/`video`/`audio`/`pdf`/`file` blocks.",
+		},
+		file_upload_id: {
+			type: "string",
+			description:
+				"For `image`/`video`/`audio`/`pdf`/`file`: ID returned by uploadFile, alternative to `url`.",
+		},
+		target_page_id: {
+			type: "string",
+			description: "For `link_to_page`: the destination page ID.",
+		},
+		target_database_id: {
+			type: "string",
+			description: "For `link_to_page`: the destination database ID.",
+		},
+		rows: {
+			type: "array",
+			items: {
+				type: "array",
+				items: { type: "string" },
+			},
+			description:
+				"For `table`: 2-D array of cell strings (rows × columns). Every row must have the same length.",
+		},
+		has_column_header: { type: "boolean" },
+		has_row_header: { type: "boolean" },
 	},
 	required: ["type"] as string[],
 	additionalProperties: false,
@@ -564,19 +619,454 @@ export const ALL_TOOLS: Record<string, Anthropic.Tool> = {
 			additionalProperties: false,
 		},
 	},
+
+	delegateScout: {
+		name: "delegateScout",
+		description:
+			"Spawn a Scout sub-agent to research a specific question against the Notion workspace + web. Scout runs in its own context, reads pages and web sources, captures findings as Sources on the Plan page, and returns a 1-3 paragraph summary. Use when you need to find more than 1-2 pages, or when the search is broad/exploratory. Do NOT use for a single readPage on a known ID. You can fan out multiple Scouts in parallel in one turn for independent angles. Returns { summary, tool_calls, tokens, duration_ms }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				query: {
+					type: "string",
+					description: "The specific question Scout should answer. Be concrete — 'find prior auth implementations' beats 'auth stuff'.",
+				},
+				context: {
+					type: "string",
+					description: "Optional 1-2 sentence context about the broader brief so Scout can prioritize.",
+				},
+			},
+			required: ["query"],
+			additionalProperties: false,
+		},
+	},
+
+	delegateLibrarian: {
+		name: "delegateLibrarian",
+		description:
+			"Spawn a Librarian sub-agent to research EXTERNAL references (docs, APIs, articles, web). Librarian has web_search and web_fetch, runs in its own context, captures findings as Sources on the Plan page, and returns a 1-3 paragraph summary with cited URLs. Use when: the brief mentions a library/API/framework, contains URLs to dig into, or asks 'how do I X' for external tooling. Fan out parallel Librarians for independent topics. Returns { summary, tool_calls, tokens, duration_ms }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				query: {
+					type: "string",
+					description: "The specific external reference question. Be concrete — 'Notion API rate limit headers' beats 'Notion rate limits'.",
+				},
+				context: {
+					type: "string",
+					description: "Optional 1-2 sentence context about the broader brief.",
+				},
+			},
+			required: ["query"],
+			additionalProperties: false,
+		},
+	},
+
+	delegateOracle: {
+		name: "delegateOracle",
+		description:
+			"Spawn an Oracle sub-agent for DEEP analysis on a hard problem — architecture tradeoffs, security implications, multi-system decisions, debugging after a failed approach. Oracle has extended thinking enabled (8k thinking budget), is read-only (no writes), and returns structured analysis + recommendation + confidence. Use when: a decision affects multiple modules, a previous approach failed and you need new angles, or the brief requires deep reasoning beyond a Scout/Librarian lookup. Returns { analysis, tool_calls, tokens, duration_ms }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				question: {
+					type: "string",
+					description: "The specific question for Oracle. Frame as a decision or analysis question, not a research question.",
+				},
+				context: {
+					type: "string",
+					description: "Context about what's been tried, what's known, what's at stake.",
+				},
+			},
+			required: ["question"],
+			additionalProperties: false,
+		},
+	},
+
+	getWorkspaceHome: {
+		name: "getWorkspaceHome",
+		description:
+			"Fetch IDs of the workspace-level Hivemind Home page and its 🪵 Activity database (cross-brief run mirror). Use when you want to surface a linked view, chart, or dashboard widget on the workspace home, or query cross-brief Activity data. Returns { home_page_id, activity_db_id, activity_ds_id } if configured, or { configured: false } if the admin hasn't run scripts/provisionWorkspaceHome yet.",
+		input_schema: {
+			type: "object" as const,
+			properties: {},
+			required: [],
+			additionalProperties: false,
+		},
+	},
+
+	readPageMarkdown: {
+		name: "readPageMarkdown",
+		description:
+			"Retrieve a page's full content as Notion-flavored markdown. Much cheaper than `readPage` (which returns one block per stringified line, capped at 100). Use when you need the full content of a longer page. Returns { markdown: string, truncated?: boolean }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				page_id: { type: "string" },
+				include_transcript: {
+					type: "boolean",
+					description:
+						"Whether to include meeting note transcripts (defaults to false).",
+				},
+			},
+			required: ["page_id"],
+			additionalProperties: false,
+		},
+	},
+
+	manageDatabase: {
+		name: "manageDatabase",
+		description:
+			"Create or modify Notion databases. Six ops via `op`: `create` (new database with initial schema), `update` (rename a database), `addProperty` (extend a data source's schema), `removeProperty`, `listTemplates` (enumerate templates on a data source), `retrieve` (fetch database metadata). Returns shape varies by op. Use when the brief needs a new structured artifact (e.g. 'create a Risk Register database').",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				op: {
+					type: "string",
+					enum: [
+						"create",
+						"update",
+						"addProperty",
+						"removeProperty",
+						"listTemplates",
+						"retrieve",
+					],
+				},
+				database_id: { type: "string" },
+				data_source_id: { type: "string" },
+				parent_page_id: { type: "string" },
+				title: { type: "string" },
+				property_name: { type: "string" },
+				property_type: {
+					type: "string",
+					enum: [
+						"title",
+						"rich_text",
+						"number",
+						"select",
+						"multi_select",
+						"status",
+						"date",
+						"people",
+						"files",
+						"checkbox",
+						"url",
+						"email",
+						"phone_number",
+						"formula",
+						"relation",
+						"rollup",
+						"created_time",
+						"created_by",
+						"last_edited_time",
+						"last_edited_by",
+						"unique_id",
+						"verification",
+					],
+				},
+				options: {
+					type: "array",
+					items: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							color: { type: "string" },
+						},
+						required: ["name"],
+						additionalProperties: false,
+					},
+					description:
+						"For select/multi_select/status property types: choices with optional colors.",
+				},
+				schema: {
+					type: "object",
+					additionalProperties: true,
+					description:
+						"For `create`: full property schema map (property_name → property config). See https://developers.notion.com/reference/property-object.",
+				},
+				expression: {
+					type: "string",
+					description: "For formula property type: the formula expression.",
+				},
+				related_data_source_id: {
+					type: "string",
+					description: "For relation property type: the data source to link.",
+				},
+			},
+			required: ["op"],
+			additionalProperties: false,
+		},
+	},
+
+	createPageFromTemplate: {
+		name: "createPageFromTemplate",
+		description:
+			"Create a page in a database, pre-populated from one of the database's templates. Use `manageDatabase({op:'listTemplates', data_source_id})` first to discover available templates. Note: template application is asynchronous — the returned page starts empty and Notion fills it in shortly after.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				data_source_id: { type: "string" },
+				template_id: {
+					type: "string",
+					description: "Template ID from listTemplates, or omit + set use_default=true.",
+				},
+				use_default: {
+					type: "boolean",
+					description: "Apply the data source's default template instead.",
+				},
+				timezone: {
+					type: "string",
+					description:
+						"IANA timezone for resolving @now/@today template variables (e.g. 'America/Los_Angeles').",
+				},
+				properties: {
+					type: "object",
+					additionalProperties: true,
+					description: "Property values for the new page (same shape as createPage).",
+				},
+			},
+			required: ["data_source_id"],
+			additionalProperties: false,
+		},
+	},
+
+	managePage: {
+		name: "managePage",
+		description:
+			"Update a page's metadata or move/trash/restore it. Six ops via `op`: `setIcon` (emoji / external URL / file_upload_id / native icon name), `setCover` (external URL / file_upload_id), `setTitle`, `move` (to a new parent page or data source), `trash` (soft delete), `restore` (un-trash). Returns { ok: true }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				op: {
+					type: "string",
+					enum: ["setIcon", "setCover", "setTitle", "move", "trash", "restore"],
+				},
+				page_id: { type: "string" },
+				emoji: { type: "string", description: "For setIcon: an emoji like 🐝." },
+				external_url: {
+					type: "string",
+					description: "For setIcon / setCover: an external image URL.",
+				},
+				file_upload_id: {
+					type: "string",
+					description:
+						"For setIcon / setCover: a file_upload_id returned by uploadFile.",
+				},
+				icon_name: {
+					type: "string",
+					description:
+						"For setIcon: a native Notion icon name (e.g. 'briefcase'). Combine with `icon_color`.",
+				},
+				icon_color: {
+					type: "string",
+					description: "For setIcon (native): icon color name.",
+				},
+				title: { type: "string", description: "For setTitle: the new title." },
+				new_parent_page_id: {
+					type: "string",
+					description: "For move: parent page to move under.",
+				},
+				new_parent_data_source_id: {
+					type: "string",
+					description:
+						"For move: data source to move under (page becomes a DB row).",
+				},
+			},
+			required: ["op", "page_id"],
+			additionalProperties: false,
+		},
+	},
+
+	uploadFile: {
+		name: "uploadFile",
+		description:
+			"Upload a file to Notion-hosted storage via the external_url mode. Notion fetches the URL, stores the file, and returns a `file_upload_id`. Use the returned id with managePage(setIcon/setCover), or as `file_upload_id` on `image`/`video`/`audio`/`pdf`/`file` blocks. Returns { file_upload_id, status }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				external_url: {
+					type: "string",
+					description: "Public URL of the file to fetch and store.",
+				},
+				filename: {
+					type: "string",
+					description:
+						"Optional override for the stored filename (defaults to URL basename).",
+				},
+				content_type: {
+					type: "string",
+					description: "Optional MIME type hint.",
+				},
+			},
+			required: ["external_url"],
+			additionalProperties: false,
+		},
+	},
+
+	manageView: {
+		name: "manageView",
+		description:
+			"All-purpose tool for working with Notion database views (table / board / calendar / timeline / gallery / list / form / chart / map / dashboard). Eight ops via the `op` discriminator: `create` (new top-level view on a database), `update` (change name/filter/sorts/config), `list` (enumerate views), `delete` (remove a view), `addWidget` (add a widget view inside an existing dashboard view), `createLinkedDatabase` (insert a linked-database block + view on a page), `query` (run a saved view's filter+sort to get matching pages), `retrieve` (full view details). See https://developers.notion.com/guides/data-apis/working-with-views for view-type-specific configuration shapes.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				op: {
+					type: "string",
+					enum: [
+						"create",
+						"update",
+						"list",
+						"delete",
+						"addWidget",
+						"createLinkedDatabase",
+						"query",
+						"retrieve",
+					],
+				},
+				view_id: { type: "string" },
+				database_id: { type: "string" },
+				data_source_id: { type: "string" },
+				dashboard_view_id: {
+					type: "string",
+					description: "For `addWidget`: the parent dashboard view's id.",
+				},
+				target_page_id: {
+					type: "string",
+					description:
+						"For `createLinkedDatabase`: the page where the linked database block goes.",
+				},
+				name: { type: "string" },
+				type: {
+					type: "string",
+					enum: [
+						"table",
+						"board",
+						"calendar",
+						"timeline",
+						"gallery",
+						"list",
+						"form",
+						"chart",
+						"map",
+						"dashboard",
+					],
+				},
+				filter: { type: "object", additionalProperties: true },
+				sorts: {
+					type: "array",
+					items: { type: "object", additionalProperties: true },
+				},
+				quick_filters: { type: "object", additionalProperties: true },
+				configuration: {
+					type: "object",
+					additionalProperties: true,
+					description:
+						"Type-specific layout configuration. Discriminated by `type` field inside (must match the view type). See Notion docs for per-view-type schema.",
+				},
+				placement: { type: "object", additionalProperties: true },
+				position: { type: "object", additionalProperties: true },
+				page_size: { type: "number" },
+				start_cursor: { type: "string" },
+			},
+			required: ["op"],
+			additionalProperties: false,
+		},
+	},
+
+	writePageMarkdown: {
+		name: "writePageMarkdown",
+		description:
+			"Write to a page using Notion-flavored markdown. Replaces appendBlocks/writeAnswer for most prose-shaped writes — converts markdown to the right block structure server-side. Four modes: `append` (add at end), `replace` (wipe everything and rewrite), `replace_range` (replace content between two anchor strings using \"start...end\" format), `update` (search-and-replace specific strings). Returns { ok: true }.",
+		input_schema: {
+			type: "object" as const,
+			properties: {
+				page_id: { type: "string" },
+				mode: {
+					type: "string",
+					enum: ["append", "replace", "replace_range", "update"],
+				},
+				content: {
+					type: "string",
+					description:
+						"The markdown content to write. For `update` mode, this field is unused — use `updates` instead.",
+				},
+				after: {
+					type: "string",
+					description:
+						"For `append` mode: optional `start...end` anchor selecting an insertion point. Omit to append at the end of the page.",
+				},
+				content_range: {
+					type: "string",
+					description:
+						"For `replace_range` mode: `start text...end text` to identify the range to replace.",
+				},
+				allow_deleting_content: {
+					type: "boolean",
+					description:
+						"Set true to allow the operation to delete child pages or databases (defaults false).",
+				},
+				updates: {
+					type: "array",
+					items: {
+						type: "object",
+						properties: {
+							old_str: { type: "string" },
+							new_str: { type: "string" },
+							replace_all_matches: { type: "boolean" },
+						},
+						required: ["old_str", "new_str"],
+						additionalProperties: false,
+					},
+					description:
+						"For `update` mode: array of search-and-replace operations.",
+				},
+			},
+			required: ["page_id", "mode"],
+			additionalProperties: false,
+		},
+	},
 };
 
 // ---------------------------------------------------------------------------
-// Per-(agent, category) whitelists
-//
-// Forge / Scribe / Sentinel split by category:
-//   - "writing" / "quick" → no Drafts DB exists. Drafters use writeAnswer, no
-//     listDrafts/getDraft/createDraft/updateDraftStatus. Sentinel reviews the
-//     project root page directly.
-//   - others → full Drafts DB toolkit, current behavior.
-//
-// Scout's tool surface doesn't depend on the drafts path — it only touches Plan.
+// Per-agent whitelists (Phase 4 — single unified shape per agent, no
+// category-driven branching). Every brief is provisioned with both the
+// Drafts DB and the Answer anchor, so the Architect gets the full surface
+// and picks `writeAnswer` (inline prose) or `createDraft` (iterative
+// artifact) at runtime based on the brief.
 // ---------------------------------------------------------------------------
+
+const ARCHITECT_TOOLS = [
+	"searchWorkspace",
+	"readPage",
+	"readDataSource",
+	"getBriefMetadata",
+	"getProjectIds",
+	"readPlanSection",
+	"setPlanSection",
+	"appendToPlanSection",
+	"writeAnswer",
+	"listDrafts",
+	"getDraft",
+	"getDraftBody",
+	"createDraft",
+	"updateDraftStatus",
+	"createSource",
+	"createDecision",
+	"createOpenQuestion",
+	"addComment",
+	"delegateScout",
+	"delegateLibrarian",
+	"delegateOracle",
+	"getWorkspaceHome",
+	"readPageMarkdown",
+	"writePageMarkdown",
+	"manageView",
+	"managePage",
+	"manageDatabase",
+	"createPageFromTemplate",
+	"uploadFile",
+	"done",
+] as const;
 
 const SCOUT_TOOLS = [
 	"searchWorkspace",
@@ -584,7 +1074,6 @@ const SCOUT_TOOLS = [
 	"readDataSource",
 	"getBriefMetadata",
 	"getProjectIds",
-	"setPlanSection",
 	"appendToPlanSection",
 	"createSource",
 	"createOpenQuestion",
@@ -592,7 +1081,17 @@ const SCOUT_TOOLS = [
 	"done",
 ] as const;
 
-const DRAFTS_DRAFTER_TOOLS = [
+const LIBRARIAN_TOOLS = [
+	"getBriefMetadata",
+	"getProjectIds",
+	"appendToPlanSection",
+	"createSource",
+	"createOpenQuestion",
+	"addComment",
+	"done",
+] as const;
+
+const ORACLE_TOOLS = [
 	"searchWorkspace",
 	"readPage",
 	"readDataSource",
@@ -602,40 +1101,10 @@ const DRAFTS_DRAFTER_TOOLS = [
 	"listDrafts",
 	"getDraft",
 	"getDraftBody",
-	"createDraft",
-	"updateDraftStatus",
-	"createDecision",
-	"createOpenQuestion",
-	"addComment",
 	"done",
 ] as const;
 
-const INLINE_DRAFTER_TOOLS_WITH_PLAN = [
-	"searchWorkspace",
-	"readPage",
-	"readDataSource",
-	"getBriefMetadata",
-	"getProjectIds",
-	"readPlanSection",
-	"writeAnswer",
-	"createDecision",
-	"createOpenQuestion",
-	"addComment",
-	"done",
-] as const;
-
-const INLINE_DRAFTER_TOOLS_NO_PLAN = [
-	"searchWorkspace",
-	"readPage",
-	"readDataSource",
-	"getBriefMetadata",
-	"getProjectIds",
-	"writeAnswer",
-	"addComment",
-	"done",
-] as const;
-
-const DRAFTS_SENTINEL_TOOLS = [
+const SENTINEL_TOOLS = [
 	"searchWorkspace",
 	"readPage",
 	"readDataSource",
@@ -651,77 +1120,84 @@ const DRAFTS_SENTINEL_TOOLS = [
 	"done",
 ] as const;
 
-const INLINE_SENTINEL_TOOLS_WITH_PLAN = [
-	"searchWorkspace",
-	"readPage",
-	"readDataSource",
-	"getBriefMetadata",
-	"getProjectIds",
-	"readPlanSection",
-	"createReview",
-	"setVerdict",
-	"addComment",
-	"done",
-] as const;
-
-const INLINE_SENTINEL_TOOLS_NO_PLAN = [
-	"searchWorkspace",
-	"readPage",
-	"readDataSource",
-	"getBriefMetadata",
-	"getProjectIds",
-	"createReview",
-	"setVerdict",
-	"addComment",
-	"done",
-] as const;
-
-function isInlineCategory(category: Category): boolean {
-	return category === "writing" || category === "quick";
-}
-
-function hasPlanPage(category: Category): boolean {
-	return category !== "quick";
-}
-
-export function getToolNamesForAgent(
-	agent: AgentName,
-	category: Category,
-): readonly string[] {
-	const inline = isInlineCategory(category);
-	const plan = hasPlanPage(category);
+export function getToolNamesForAgent(agent: AgentName): readonly string[] {
 	switch (agent) {
+		case "Architect":
+			return ARCHITECT_TOOLS;
 		case "Scout":
 			return SCOUT_TOOLS;
+		case "Librarian":
+			return LIBRARIAN_TOOLS;
+		case "Oracle":
+			return ORACLE_TOOLS;
 		case "Forge":
 		case "Scribe":
-			if (!inline) return DRAFTS_DRAFTER_TOOLS;
-			return plan
-				? INLINE_DRAFTER_TOOLS_WITH_PLAN
-				: INLINE_DRAFTER_TOOLS_NO_PLAN;
+			// Forge/Scribe are v1 agent identifiers retained in the union for
+			// transitional reasons (createDraft labels `Author Agent` based on
+			// agentName). They're never spawned in v2 — fall back to the
+			// Architect surface so any accidental call still has a sane toolset.
+			return ARCHITECT_TOOLS;
 		case "Sentinel":
-			if (!inline) return DRAFTS_SENTINEL_TOOLS;
-			return plan
-				? INLINE_SENTINEL_TOOLS_WITH_PLAN
-				: INLINE_SENTINEL_TOOLS_NO_PLAN;
+			return SENTINEL_TOOLS;
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Server-side tools (executed by Anthropic, not by our dispatcher)
+//
+// Granted to research sub-agents: Scout (workspace + web) and Librarian
+// (external references). web_search yields cited snippets; web_fetch
+// retrieves a URL's full content with optional citations. Both are GA on
+// the public Claude API and supported by claude-haiku-4-5.
+// ---------------------------------------------------------------------------
+
+const WEB_SERVER_TOOLS: BetaToolUnion[] = [
+	{
+		type: "web_search_20250305",
+		name: "web_search",
+		// Cost guardrail: Anthropic bills $10 / 1,000 web_search calls,
+		// so this caps the per-run search spend.
+		max_uses: 5,
+		user_location: {
+			type: "approximate",
+			city: "San Francisco",
+			region: "California",
+			country: "US",
+			timezone: "America/Los_Angeles",
+		},
+	},
+	{
+		type: "web_fetch_20250910",
+		name: "web_fetch",
+		// web_fetch returns FULL page content. Chain budget is 200k tokens
+		// and 2-3 Librarian fan-outs are common, so this is tight on purpose:
+		// 3 × 8k = 24k worst case per Librarian.
+		max_uses: 3,
+		max_content_tokens: 8_000,
+		citations: { enabled: true },
+	},
+];
 
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
-export function getToolsForAgent(
-	agent: AgentName,
-	category: Category,
-): Anthropic.Tool[] {
-	return getToolNamesForAgent(agent, category).map((name) => {
-		const tool = ALL_TOOLS[name];
-		if (!tool) {
-			throw new Error(
-				`Tool "${name}" in ${agent}/${category} whitelist not found in ALL_TOOLS`,
-			);
-		}
-		return tool;
-	});
+const WEB_TOOL_AGENTS: ReadonlySet<AgentName> = new Set(["Scout", "Librarian"]);
+
+export function getToolsForAgent(agent: AgentName): BetaToolUnion[] {
+	const customTools: BetaToolUnion[] = getToolNamesForAgent(agent).map(
+		(name) => {
+			const tool = ALL_TOOLS[name];
+			if (!tool) {
+				throw new Error(
+					`Tool "${name}" in ${agent} whitelist not found in ALL_TOOLS`,
+				);
+			}
+			return tool as BetaToolUnion;
+		},
+	);
+	if (WEB_TOOL_AGENTS.has(agent)) {
+		return [...customTools, ...WEB_SERVER_TOOLS];
+	}
+	return customTools;
 }

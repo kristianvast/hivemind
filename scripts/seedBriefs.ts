@@ -54,6 +54,7 @@ const STATUS_OPTIONS: SelectOption[] = [
 
 const OWNER_OPTIONS: SelectOption[] = [
 	{ name: "Triage", color: "default" },
+	{ name: "Architect", color: "yellow" },
 	{ name: "Scout", color: "blue" },
 	{ name: "Forge", color: "orange" },
 	{ name: "Scribe", color: "purple" },
@@ -160,11 +161,6 @@ async function main(): Promise<void> {
 				Owner: { select: { options: OWNER_OPTIONS } },
 				Category: { select: { options: CATEGORY_OPTIONS } },
 				"📁 Project": { url: {} },
-				"Hivemind State": {
-					rich_text: {},
-					description:
-						"🔒 Internal Hivemind orchestrator state. Managed by the worker — do not edit.",
-				},
 			},
 		},
 	};
@@ -210,7 +206,7 @@ async function main(): Promise<void> {
 	console.log("  3. Push to the deployed worker:");
 	console.log("     ntn workers env push --yes");
 	console.log("");
-	console.log("  4. Hide internal state from the UI:");
+	console.log("  4. Apply UX bootstrap (📁 Project URL + remove legacy state prop):");
 	console.log("     bun run scripts/configureBriefsUI.ts");
 	console.log("");
 	console.log("  5. In Notion, on the new DB:");

@@ -1,10 +1,10 @@
 // scripts/migrateBriefs.ts
 //
-// Idempotent migration: adds Category, Hivemind State, and 📁 Project
-// properties to the existing Hivemind Briefs data source. Safe to re-run.
+// Idempotent migration: adds Category and 📁 Project properties to the
+// existing Hivemind Briefs data source. Safe to re-run.
 //
-// For the UX polish on top (description on Hivemind State, hide it from
-// views), run scripts/configureBriefsUI.ts after this.
+// For the UX polish on top (📁 Project backfill + removal of the legacy
+// Hivemind State property), run scripts/configureBriefsUI.ts after this.
 //
 // Usage: npx tsx --env-file=.env scripts/migrateBriefs.ts
 
@@ -58,13 +58,6 @@ async function main(): Promise<void> {
 		console.log("  = Category already present, skipping");
 	}
 
-	if (!existingProps["Hivemind State"]) {
-		updates["Hivemind State"] = { rich_text: {} };
-		console.log("  + adding Hivemind State (rich_text)");
-	} else {
-		console.log("  = Hivemind State already present, skipping");
-	}
-
 	if (!existingProps["📁 Project"]) {
 		updates["📁 Project"] = { url: {} };
 		console.log("  + adding 📁 Project (url)");
@@ -84,7 +77,7 @@ async function main(): Promise<void> {
 	});
 	console.log("Migration complete.");
 	console.log(
-		"\nNext: hide Hivemind State from views and add a property description:",
+		"\nNext: backfill 📁 Project URLs and remove the legacy Hivemind State property:",
 	);
 	console.log("  bun run scripts/configureBriefsUI.ts");
 }
