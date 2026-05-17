@@ -1,164 +1,331 @@
-# Hivemind
+<div align="center">
 
-> A multi-agent operating system that runs inside Notion. Notion is the hive, your agents are the swarm.
+# 🐝 Hivemind
 
-Hivemind turns a Notion database row into a populated project subtree. You drop a brief — a title, a body, optionally a category — flip its `Status` to `Triaged`, and an autonomous **Architect** agent plans the work, writes the deliverable, and delegates to specialist sub-agents (Scout, Librarian, Oracle, Sentinel, and Anvil) as needed. Notion is the database, the orchestrator UI, and the deliverable surface — all at once.
+**A multi-agent operating system that lives inside Notion.**
 
-## What you get out of the box
+[![Built at Notion Developer Platform Hackathon](https://img.shields.io/badge/%F0%9F%8F%86%20Built%20at-Notion%20Developer%20Platform%20Hackathon-000000?labelColor=000000)](https://luma.com/fyuf7)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522-339933?logo=node.js&logoColor=white)](package.json)
+[![TypeScript strict](https://img.shields.io/badge/typescript-strict-3178c6?logo=typescript&logoColor=white)](tsconfig.json)
+[![Notion Workers SDK](https://img.shields.io/badge/Notion-Workers%20SDK-000000?logo=notion&logoColor=white)](https://developers.notion.com/docs/notion-workers)
+[![Anthropic Claude](https://img.shields.io/badge/powered%20by-Claude%20Haiku%204.5-d97757?logo=anthropic&logoColor=white)](https://anthropic.com)
+[![Status](https://img.shields.io/badge/status-research%20preview-orange.svg)](#-roadmap)
 
-- **Brief → subtree pipeline.** Each brief gets an idempotent project subtree: an Answer anchor, a Plan page, a Drafts DB, and Sources / Decisions / Open Questions / Activity mini-DBs. The Architect picks `writeAnswer` (inline prose) or `createDraft` (iterative artifact) at runtime.
-- **Single-Architect orchestration.** One model end-to-end. It uses a hand-rolled Anthropic tool-use loop (`src/agentLoop.ts`) with a strict per-agent tool whitelist (`src/tools/registry.ts`) and a write-scope guard (`src/scope.ts`) that prevents stray writes outside the brief's subtree.
-- **Specialist sub-agents** spawned via `delegateScout` / `delegateLibrarian` / `delegateOracle` / `delegateAnvil` tools. Each runs in its own context with its own budget; only the final `done({summary})` payload flows back to the Architect — sub-agent working tokens never enter the Architect's context.
-- **Anvil — local executor.** When a brief is "build and demonstrate something visual" (landing page, UI mockup), the Architect delegates to Anvil, which writes files into a temp dir, serves them over a localhost HTTP server, drives a headless Chromium via Playwright, and embeds the screenshot back into the Notion page. Anvil runs **only in `--local` orchestrator mode**.
-- **Layered rate-limit defenses** for the status-change webhook: in-memory storm gate, chain lock + coalesce window, bot-edit filter, fast-path early-exit on non-trigger deliveries, and a `triagedRescue` sync (every 2 min) as a backstop. Briefs cannot get stuck at `Triaged` even if the webhook is fully locked out.
-- **Token budget circuit breaker.** Per-brief token cap (`src/budget.ts`) trips the orchestrator to `Status=Failed` rather than burning unbounded API spend.
+<p><em>Drop a brief into a Notion database. An autonomous <strong>Architect</strong>, backed by a swarm of specialist sub-agents, plans, researches, builds, and ships the deliverable.<br/>Right inside your workspace. No new tabs. No new tools.</em></p>
 
-## Architecture at a glance
+</div>
+
+> ### 🏆 Built for the [Notion Developer Platform Hackathon](https://luma.com/fyuf7) · May 16–17, 2026 · San Francisco
+>
+> Hivemind was built over the weekend Notion launched its [new Developer Platform](https://techcrunch.com/2026/05/13/notion-just-turned-its-workspace-into-a-hub-for-ai-agents/) — Workers, data-source syncs, agent tools, webhooks, _"no servers, no infra, just a CLI and your ideas."_ Sponsored by Anthropic, OpenAI, and Vercel. This repo is the result: a full multi-agent system that uses Notion itself as the database, the orchestrator UI, and the deliverable surface.
+
+---
+
+## ✨ See it in 30 seconds
+
+You write **one row** in a Notion database and flip its `Status` to `Triaged`. Hivemind does the rest.
+
+> **📋 Brief**
+>
+> **Title:** Build a Notion template for tracking engineering project risks
+>
+> **Body:** Create a Risk Register database with Name, Severity, Status, Owner, and Captured Date. Seed it with 5 realistic risks for a SaaS launch. Add a Kanban view grouped by Severity so we can see the risk landscape at a glance.
+
+A few minutes later, the same Notion page has grown a whole subtree — **the Architect detected this was a demo-shaped brief** and produced rich Notion artifacts on top of the prose answer:
+
+```text
+📁 Build a Notion template for tracking engineering project risks
+│
+├── 📄 Answer
+│   └── "Risk Register template ready. 5 seeded risks, Kanban view by Severity. ↓"
+│
+├── 📋 Plan
+│   ├── Context     "SaaS launch risk tracking. Need severity + status + ownership."
+│   ├── Approach    "Create DB + view. Demo mode triggered → rich artifacts."
+│   ├── Decisions   [empty — no architectural choices needed]
+│   ├── Sources     [empty]
+│   └── Status      "Completed."
+│
+├── 🗃️  Risk Register                    ← created by the Architect at runtime
+│   ├── Properties:  Name · Severity · Status · Owner · Captured Date
+│   ├── Rows:
+│   │   ├── Auth service outage           critical    open        @platform
+│   │   ├── Database replication lag      high        open        @infra
+│   │   ├── Payment processor delay       high        mitigating  @payments
+│   │   ├── Compliance audit failure      medium      open        @security
+│   │   └── Team onboarding bottleneck    low         open        @people
+│   └── 📊 Kanban view  grouped by Severity (Critical · High · Medium · Low)
+│
+├── ✏️  Drafts                            (empty — Architect chose writeAnswer)
+├── 🔎 Sources                           (empty — no external research needed)
+├── ⚖️  Decisions                         (empty)
+├── ❓ Open Questions                     (empty)
+│
+└── 📜 Activity
+    └── Architect run #1 — 12,847 tokens · 1m 52s · completed
+```
+
+The whole loop runs inside Notion. No new tabs, no separate tool, no dashboard to babysit.
+
+---
+
+## 🧠 How it works
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant N as Notion DB
+    participant W as Hivemind Worker
+    participant A as 🧠 Architect
+    participant S as 🐝 Sub-agents
+    participant V as 🛡️ Sentinel
+
+    You->>N: Drop brief · Status = Triaged
+    N->>W: webhook fires
+    W->>W: storm gate · chain lock · bot-edit filter
+    W->>A: runOrchestrator(briefId)
+
+    Note over A: plan → research → write
+    A->>S: delegate (Scout · Librarian · Oracle · Anvil)
+    S-->>A: summary only (context stays lean)
+    A->>N: writes Plan, Drafts, DBs, Answer, …
+
+    A->>V: hand off
+    V->>N: verdict
+
+    alt approved
+        V->>N: Status = Needs Review
+        You->>N: skim → flip to Done
+    else needs revision
+        V->>N: Status = In Progress
+        A->>A: revise · iterate
+    end
+```
+
+**State machine:** `Backlog → Triaged → In Progress → Needs Review → Done | Failed`
+
+**Belt-and-suspenders:** if the webhook is rate-limited, a `triagedRescue` sync runs every 2 minutes through the same chain lock and picks up whatever the webhook missed. Briefs cannot get stuck at `Triaged`.
+
+---
+
+## 🐝 Meet the swarm
+
+| Agent | Role | When it's called |
+|---|---|---|
+| **🧠 Architect** | Plans, researches, and writes the deliverable. Sees the whole brief. | **Always.** Drives every run end-to-end. |
+| **🔭 Scout** | Workspace search — Notion pages, databases, optional web. | When the brief touches multiple existing workspace pages. |
+| **📚 Librarian** | External reference research — official docs, libraries, APIs, articles. | Unfamiliar dependency or non-obvious external behavior. |
+| **🔮 Oracle** | Deep analysis with extended thinking. Read-only. | Hard tradeoffs, security implications, complex logic. |
+| **🛡️ Sentinel** | Reviews the Architect's output. Approves or requests revision. | **Always**, as a fixed post-step (P3 makes it delegated). |
+| **⚒️ Anvil** | Local filesystem · localhost HTTP server · headless Chromium · screenshot proof. | Build-and-demo briefs (landing pages, UI mockups) in `--local` mode. |
+
+Each sub-agent runs in its own context window with its own token budget. Only the `done({summary})` payload returns to the Architect — **sub-agent working tokens never enter the Architect's context**, which is what lets one cheap model orchestrate work that would normally need a frontier model.
+
+---
+
+## 🚀 Quick start
+
+```bash
+# 1. Clone + install
+git clone https://github.com/kristianvast/hivemind
+cd hivemind
+npm install
+npm install -g @notionhq/workers    # the ntn CLI
+
+# 2. Connect to your Notion workspace (one-time)
+ntn login
+
+# 3. Scaffold the Briefs database in Notion
+npx tsx scripts/seedBriefs.ts
+
+# 4. Fill in credentials
+cp .env.example .env                # then edit .env — see .env.example
+                                    # for where to get each token
+
+# 5. Validate before you spend a dollar
+npm run check                       # tsc --noEmit
+npx tsx scripts/validateBriefsDb.ts # checks schema + env vars
+
+# 6. Run end-to-end against a real brief
+ntn workers exec runOrchestrator --local -d '{"briefId":"<page-id>"}'
+```
+
+When you're ready to let Notion fire the loop automatically:
+
+```bash
+ntn workers deploy                  # publishes the Worker
+ntn workers env push                # pushes your .env to the deployed runtime
+```
+
+Then add a Notion automation on the Briefs DB: **when `Status is Triaged` → POST to the deployed webhook URL with header `X-Hivemind-Secret: <your secret>`**.
+
+> 💡 **The single most useful debugging command:**
+>
+> ```bash
+> ntn workers runs list --plain | head -n1 | cut -f1 | xargs -I{} ntn workers runs logs {}
+> ```
+
+---
+
+## 🚦 Roadmap
+
+| Phase | Description | Status |
+|---|---|---|
+| **P1** | Single-Architect orchestrator + idempotent subtree provisioning | ✅ shipped |
+| **P2** | Sub-agent delegation (Scout · Librarian · Oracle · Anvil) | ✅ shipped |
+| **P4** | Unified provisioning shape (was Category-branched in v1) | ✅ shipped |
+| **P3** | Sentinel as a delegated sub-agent (currently a fixed post-step) | 🟡 pending |
+| **P5** | Multi-turn refinement loop between Sentinel verdicts | 🟡 pending |
+
+The active design doc with decisions D1–D14: [`.sisyphus/plans/hivemind-v2-orchestrator.md`](.sisyphus/plans/hivemind-v2-orchestrator.md). A newer v3 direction ("Notion power-user Architect") is being explored in [`.sisyphus/plans/hivemind-v3-notion-power-user.md`](.sisyphus/plans/hivemind-v3-notion-power-user.md). The original v1 design lives in [`.sisyphus/archive/PLANNING-v1.md`](.sisyphus/archive/PLANNING-v1.md).
+
+---
+
+## ⚒️ Anvil — the local executor
+
+When a brief is **build me something visual** — a landing page, a UI mockup, an interactive prototype — the Architect calls `delegateAnvil` instead of just writing prose. Anvil:
+
+1. Carves a temp directory at `os.tmpdir()/hivemind-anvil-<briefId>-<ts>/`
+2. Writes real files (HTML, CSS, JS, assets)
+3. Boots a `127.0.0.1` HTTP server on an auto-allocated port
+4. Drives a headless Chromium via Playwright
+5. Embeds the screenshot **back into the Notion page** as proof
+6. Leaves the server running so you can open the URL yourself
+
+```
+⚒️   ANVIL SERVERS STILL RUNNING
+     • http://127.0.0.1:54231 — Build a Notion template for tracking risks
+```
+
+Ctrl+C exits. Anvil only runs in `--local` orchestrator mode — it needs a real filesystem and a real port.
+
+There's also a heavier VM-backed Anvil daemon in [`anvil/`](anvil/) — Pusher-dispatched, runs work inside an E2B Firecracker microVM or a local Lima VM, and ships the result as a GitHub PR. The two paths coexist.
+
+---
+
+## 📐 Architecture
+
+<details>
+<summary><strong>Full webhook → orchestrator → agent loop (click to expand)</strong></summary>
 
 ```
 Notion (Briefs DB)
    │
    │  Status: Backlog → Triaged → In Progress → Needs Review → Done | Failed
    │
-   └─▶ onBriefStatusChange (webhook capability)
-          ├─ storm gate (in-memory, per-page)
-          ├─ chain lock (shared with rescue sync)
-          ├─ bot-edit filter (skip self-edits)
+   └─▶ onBriefStatusChange  (webhook capability)
+          │
+          ├─ storm gate       in-memory, per-page, 12 events / 10s
+          ├─ chain lock       shared with rescue sync (15 min TTL)
+          ├─ bot-edit filter  skip edits the agents themselves make
+          ├─ fast-path        non-trigger deliveries cost 1 Notion API call
+          │
           └─▶ runOrchestrator(briefId)
                  │
-                 ├─ provision subtree (idempotent)
-                 ├─ Architect ⟳ tool-use loop ─▶ delegateScout / delegateLibrarian / delegateOracle / delegateAnvil
-                 └─ Sentinel post-step ─▶ verdict → Needs Review | back to In Progress
+                 ├─ provision subtree   (idempotent)
+                 │
+                 ├─ Architect  ⟳ tool-use loop
+                 │   └─▶ delegateScout / delegateLibrarian / delegateOracle / delegateAnvil
+                 │
+                 └─ Sentinel post-step ─▶ verdict
+                                          ├─ approve → Status = Needs Review
+                                          └─ revise  → Status = In Progress (retry)
 
 triagedRescue sync (every 2 min) ─▶ same chain lock ─▶ same runOrchestrator
-                                                       (catches what the webhook missed)
+                                                       (backstop if the webhook is locked out)
 ```
 
-State lives in a collapsed `🔒 Hivemind internal state (do not edit)` toggle on each brief page (single JSON code block) — see `src/state.ts`.
+**Rate-limit defenses, layered so any single misconfiguration cannot strand briefs at `Triaged`:**
 
-## Project layout
+| Layer | Lives in | Purpose |
+|---|---|---|
+| Storm gate | [`src/index.ts`](src/index.ts) | Suppress a page after >12 deliveries in 10s — zero Notion API calls during suppression |
+| Chain lock + coalesce | [`src/lock.ts`](src/lock.ts) | One run per brief at a time; absorbs Notion automation retry storms |
+| Bot-edit filter | [`src/index.ts`](src/index.ts) | Skip edits made by the agents (matches `HIVEMIND_BOT_USER_ID`) |
+| Fast-path early-exit | [`src/index.ts`](src/index.ts) | Non-`Triaged`/`Done` deliveries cost a single `pages.retrieve` call |
+| `triagedRescue` sync | [`src/rescue.ts`](src/rescue.ts) | Backstop — runs every 2 min on its own per-capability budget |
 
-```
+**Token budget circuit breaker** — [`src/budget.ts`](src/budget.ts) trips the orchestrator to `Status=Failed` if a single brief burns more than 400k tokens, rather than running up the bill silently.
+
+**State storage** — `HivemindState` lives in a collapsed `🔒 Hivemind internal state (do not edit)` toggle on each brief page (single JSON code block). See [`src/state.ts`](src/state.ts).
+
+</details>
+
+---
+
+## 📂 Project layout
+
+```text
 src/
-  index.ts          Worker entrypoint + capabilities + webhook router + storm gate
-  orchestrator.ts   v2 orchestrator — locks, provisions, runs Architect, runs Sentinel
-  architect.ts      Architect system prompt + agent spec
-  subagents.ts      Scout / Librarian / Oracle / Sentinel / Anvil specs
-  agents.ts         invokeAgent — uniform wrapper around runAgent for any spec
-  agentLoop.ts      Hand-rolled Anthropic tool-use loop
-  anvil.ts          In-process Anvil session (temp dir + localhost HTTP + Playwright)
+  index.ts          Worker entrypoint · capabilities · webhook router · storm gate
+  orchestrator.ts   locks · provisions · runs Architect · runs Sentinel
+  architect.ts      Architect system prompt + spec  ← the magic lives here
+  subagents.ts      Scout · Librarian · Oracle · Sentinel · Anvil specs
+  agents.ts         invokeAgent — uniform wrapper over runAgent
+  agentLoop.ts      hand-rolled Anthropic tool-use loop
+  anvil.ts          in-process Anvil session (tmp dir · HTTP · Playwright)
   tools/
-    registry.ts     Tool schemas (per-agent whitelists)
-    handlers.ts     Tool dispatch + scope guard
-  provision.ts      Per-brief subtree provisioner (idempotent)
-  notion.ts         Block builders, brief context loader, status helpers
-  state.ts          HivemindState — stored in a collapsed toggle on the brief page
-  scope.ts          Write-scope guard (project subtree only)
-  pacer.ts          Shared RPS pacer (Notion API)
-  budget.ts         Per-brief token budget circuit breaker
-  rescue.ts         triagedRescue sync — backstop for webhook rate-limit lockouts
-  lock.ts           Chain lock (shared between webhook and rescue)
-  classify.ts       Category classifier (informational only in v2)
-anvil/              Separate VM-backed executor daemon (Pusher + Lima/E2B + GitHub PRs)
-.examples/          Working Notion Workers SDK samples (sync, tool, automation, OAuth, webhook)
-.agents/            Internal-facing agent contract + skills
-scripts/            Admin scripts: seedBriefs, inspectBrief, validateBriefsDb, etc.
+    registry.ts     tool schemas + per-agent whitelists
+    handlers.ts     dispatch + scope guard
+  provision.ts      idempotent per-brief subtree provisioner
+  notion.ts         block builders · brief context loader · status helpers
+  state.ts          HivemindState (collapsed toggle on the brief page)
+  scope.ts          write-scope guard (project subtree only)
+  rescue.ts         triagedRescue sync — webhook backstop
+  lock.ts           chain lock (shared between webhook and rescue)
+  budget.ts         per-brief token budget circuit breaker
+  pacer.ts          shared Notion API RPS pacer
+
+anvil/              VM-backed executor daemon (separate package)
+.examples/          working Notion Workers SDK samples
+.agents/            internal-facing agent contract + skills
+scripts/            admin scripts (seedBriefs, validateBriefsDb, probe*, …)
 ```
 
-Internal contract / deep dive: see [`AGENTS.md`](AGENTS.md).
+Internal contract / deep architectural notes: see [`AGENTS.md`](AGENTS.md).
 
-## Quick start
+---
 
-### Prerequisites
+## 🛡️ Gotchas worth knowing before you change something
 
-- Node ≥ 22, npm ≥ 10.9.2
-- A Notion workspace with the Notion Workers CLI installed: `npm install -g @notionhq/workers`
-- API keys: Anthropic (Architect + sub-agents), OpenAI (Sentinel), optionally Pusher (Anvil dispatch)
+<details>
+<summary>Open the gotcha list</summary>
 
-### Set up
+- **`data_source_id`, not `database_id`.** A Notion database is a container for one or more data sources; the public API operates on data sources. The default SDK API version is `2025-09-03`. Use `ntn datasources resolve <db>` to list the data sources inside a DB.
+- **Scope guard.** Every agent write goes through [`src/scope.ts`](src/scope.ts). Writes outside the brief's project subtree are caught and reported — not silently dropped. Be deliberate when you add a new tool: wire it through the guard.
+- **Bot-edit filter.** Every `Status` write the Architect or Sentinel makes would otherwise loop back through the webhook and trigger another run. The filter compares `page.last_edited_by.id` against `HIVEMIND_BOT_USER_ID`. Keep that env var populated.
+- **Tool-use truncation.** If a single Architect response emits more output tokens than its `maxTokens` (default `16384` for the Architect, `8192` for sub-agents), the loop throws `max_tokens hit — agent may have produced truncated tool_use`. Raise the cap if you see this for legitimately large outputs (long `writeAnswer` bodies, big `createChildPage` block arrays).
+- **`Status=Triaged` stuck for >5 minutes?** The webhook is probably rate-limited. `ntn workers deploy` resets the per-capability budget, and `triagedRescue` will catch up in the meantime. The full symptom-to-action runbook is in [`AGENTS.md`](AGENTS.md).
 
-1. **Create the Briefs database in Notion.** Run `npx tsx scripts/seedBriefs.ts` after you've connected your integration. It scaffolds the schema (Status, Owner, Category, 📁 Project, etc.) and creates a couple of sample briefs.
+</details>
 
-2. **Copy and fill the environment template.**
+---
 
-   ```bash
-   cp .env.example .env
-   # fill in NOTION_API_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY,
-   # HIVEMIND_BRIEFS_DATABASE_ID, HIVEMIND_WEBHOOK_SECRET, HIVEMIND_BOT_USER_ID
-   ```
+## 🤝 Contributing
 
-   See [`.env.example`](.env.example) for the full list with comments on where to get each value.
+This started as a hackathon project and is now an open-source research preview. Issues and PRs welcome.
 
-3. **Validate the setup.**
+Before submitting code, please read [`AGENTS.md`](AGENTS.md) and the [v2 design doc](.sisyphus/plans/hivemind-v2-orchestrator.md) — the architecture is opinionated and the surface area is small on purpose.
 
-   ```bash
-   npm run check                              # tsc --noEmit
-   npx tsx scripts/validateBriefsDb.ts        # verifies DB schema + env vars
-   ```
-
-4. **Run end-to-end locally** against a real brief.
-
-   ```bash
-   ntn login                                  # one-time, connects to your workspace
-   ntn workers exec runOrchestrator --local -d '{"briefId":"<page-id>"}'
-   ```
-
-   `--local` runs the Worker on your machine with `.env` loaded. In-process Anvil only works in `--local` mode — it needs a real filesystem and a real port.
-
-5. **Deploy to Notion's runtime** (so the webhook fires automatically when briefs are triaged in the UI).
-
-   ```bash
-   ntn workers deploy
-   ntn workers env push                       # push .env to the deployed Worker
-   ```
-
-   Then configure the Notion automation on the Briefs DB to POST to the deployed webhook URL when `Status is Triaged` (and again when `Status is Done`, if you use the Anvil dispatch path). Add header `X-Hivemind-Secret: <your HIVEMIND_WEBHOOK_SECRET>`. Test it didn't over-fire with `npx tsx scripts/automationCanary.ts <briefId>`.
-
-### Run logs (the single most useful debugging command)
-
-```bash
-ntn workers runs list --plain | head -n1 | cut -f1 | xargs -I{} ntn workers runs logs {}
-```
-
-## Status
-
-| Phase | Status |
-|---|---|
-| P1 — single-Architect orchestrator + idempotent provisioning | ✅ shipped |
-| P2 — sub-agent delegation (Scout / Librarian / Oracle / Anvil) | ✅ shipped |
-| P3 — Sentinel as a delegated sub-agent (currently a fixed post-step) | 🟡 pending |
-| P4 — unified provisioning shape (was Category-branched) | ✅ shipped |
-| P5 — multi-turn refinement loop | 🟡 pending |
-
-The active architecture plan with decisions D1–D14 lives at [`.sisyphus/plans/hivemind-v2-orchestrator.md`](.sisyphus/plans/hivemind-v2-orchestrator.md). A newer v3 direction (Notion power-user Architect) is being explored in [`.sisyphus/plans/hivemind-v3-notion-power-user.md`](.sisyphus/plans/hivemind-v3-notion-power-user.md); the v1 plan lives in [`.sisyphus/archive/PLANNING-v1.md`](.sisyphus/archive/PLANNING-v1.md).
-
-## Concepts worth knowing before you change something
-
-- **`data_source_id`, not `database_id`.** A Notion database is a container for one or more data sources; the public API operates on data sources. Default SDK API version is `2025-09-03`. `ntn datasources resolve <database-id>` lists the data sources inside a DB.
-- **Scope guard.** All agent writes go through `src/scope.ts`. Writes outside the brief's project subtree are caught and reported, not silently dropped. Be deliberate when you add a new tool — wire it through the guard.
-- **Bot-edit filter.** Every status-write the Architect/Sentinel make would otherwise loop back through the webhook. The webhook compares `page.last_edited_by.id` against `HIVEMIND_BOT_USER_ID` to break the loop. Keep that env var populated.
-- **Tool-use truncation.** If a single Architect response emits more output tokens than `maxTokens`, the loop throws `max_tokens hit — agent may have produced truncated tool_use`. Raise the per-agent cap if you see this for legitimate large outputs (long `writeAnswer` bodies, big `createChildPage` block arrays).
-
-## Anvil (the local executor)
-
-Two flavors:
-
-- **In-process Anvil** (`src/anvil.ts`) — the default. Spawned by the Architect via `delegateAnvil({ task, context })` only in `--local` orchestrator mode. Writes files into `os.tmpdir()/hivemind-anvil-<briefId>-<ts>/`, serves them on a 127.0.0.1 auto-allocated port, drives a headless Chromium via Playwright, and embeds the screenshot back into the brief's project root. The HTTP server is intentionally **not** `unref()`'d, so the human can visit the URL after `runOrchestrator` returns. Ctrl+C exits.
-- **VM-backed Anvil daemon** (`anvil/`) — the heavier path. Subscribes to a Pusher channel; the Worker publishes `brief.dispatched` events when a brief gets `Owner=Forge-Local`. Anvil then runs the work in an E2B Firecracker microVM or a local Lima VM and ships the result back as a GitHub PR. See [`anvil/README.md`](anvil/README.md).
-
-Both paths can coexist.
-
-## Contributing
-
-This is a personal R&D project that's now open source. If you find it useful, file an issue or open a PR — but please read [`AGENTS.md`](AGENTS.md) and the v2 plan first; the architecture is opinionated and the surface area is small on purpose.
-
-Style notes:
+**Style notes**
 
 - TypeScript with `strict` enabled. Explicit types at I/O boundaries.
 - **Tabs** for indentation. Capability keys in `lowerCamelCase`.
-- Commit format: `feat(scope): ...`, `fix(scope): ...`, `chore: ...`.
-- Run `npm run check` before pushing.
+- Commit format: `feat(scope): …`, `fix(scope): …`, `chore: …`.
+- `npm run check` must pass before you push.
 
-## License
+---
 
-[MIT](LICENSE) © 2026 Kristian Vast
+## 🙏 Thanks
+
+To the Notion team for shipping the Developer Platform and hosting a hackathon that gave this project a starting line. To the sponsors — [Anthropic](https://anthropic.com), [OpenAI](https://openai.com), and [Vercel](https://vercel.com) — for the credits and the encouragement.
+
+---
+
+<div align="center">
+
+**[MIT](LICENSE)** · © 2026 Kristian Vast
+
+</div>
