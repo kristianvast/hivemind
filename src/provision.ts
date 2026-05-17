@@ -446,7 +446,7 @@ async function findOrCreateProjectDatabase(
 	return createProjectDatabase(notion, rootId, title, properties);
 }
 
-type NotionWithViews = Client & {
+type NotionWithViews = {
 	views?: {
 		list(args: { database_id?: string; data_source_id?: string }): Promise<{ results: { id: string }[] }>;
 		retrieve(args: { view_id: string }): Promise<{ id: string; name?: string }>;
@@ -455,7 +455,7 @@ type NotionWithViews = Client & {
 };
 
 async function viewNames(notion: Client, dbId: string): Promise<Set<string>> {
-	const views = (notion as NotionWithViews).views;
+	const views = (notion as unknown as NotionWithViews).views;
 	if (!views) return new Set();
 	const listed = await views.list({ database_id: dbId });
 	const names = new Set<string>();
@@ -474,7 +474,7 @@ async function ensureView(
 	type: string,
 	extra: Record<string, unknown> = {},
 ): Promise<void> {
-	const views = (notion as NotionWithViews).views;
+	const views = (notion as unknown as NotionWithViews).views;
 	if (!views) return;
 	const existing = await viewNames(notion, databaseId);
 	if (existing.has(name)) return;
@@ -745,13 +745,52 @@ export async function provisionProject(
 		}
 	}
 
+	let sourcesIds: DbIds | undefined = state.dsIds?.sources;
+	let decisionsIds: DbIds | undefined = state.dsIds?.decisions;
+	let openQuestionsIds: DbIds | undefined = state.dsIds?.openQuestions;
+	if (needsPlan) {
+		if (!sourcesIds) {
+			sourcesIds = await findOrCreateProjectDatabase(
+				notion,
+				projectRootId,
+				scan,
+				SOURCES_DB_TITLE,
+				SOURCES_DB_PROPERTIES,
+			);
+		}
+		if (!decisionsIds) {
+			decisionsIds = await findOrCreateProjectDatabase(
+				notion,
+				projectRootId,
+				scan,
+				DECISIONS_DB_TITLE,
+				DECISIONS_DB_PROPERTIES,
+			);
+		}
+		if (!openQuestionsIds) {
+			openQuestionsIds = await findOrCreateProjectDatabase(
+				notion,
+				projectRootId,
+				scan,
+				OPEN_QUESTIONS_DB_TITLE,
+				OPEN_QUESTIONS_DB_PROPERTIES,
+			);
+		}
+	}
+
 	state = {
 		...state,
 		projectRootId,
 		planPageId: planPageId ?? state.planPageId,
 		activityPageId,
 		answerAnchorBlockId,
-		dsIds: draftsIds ? { drafts: draftsIds } : state.dsIds,
+		dsIds: {
+			...state.dsIds,
+			...(draftsIds ? { drafts: draftsIds } : {}),
+			...(sourcesIds ? { sources: sourcesIds } : {}),
+			...(decisionsIds ? { decisions: decisionsIds } : {}),
+			...(openQuestionsIds ? { openQuestions: openQuestionsIds } : {}),
+		},
 	};
 	await writeHivemindState(notion, briefId, state);
 
@@ -770,6 +809,13 @@ export async function provisionProject(
 		});
 	}
 
+	await enrichProjectDashboard(notion, projectRootId, {
+		drafts: draftsIds,
+		sources: sourcesIds,
+		decisions: decisionsIds,
+		openQuestions: openQuestionsIds,
+	});
+
 	await writeProjectUrlToBrief(notion, briefId, projectRootId);
 
 	const persistedState: HivemindState = state;
@@ -778,7 +824,12 @@ export async function provisionProject(
 		planPageId: planPageId ?? null,
 		activityPageId,
 		answerAnchorBlockId,
-		dbs: draftsIds ? { drafts: draftsIds } : {},
+		dbs: {
+			...(draftsIds ? { drafts: draftsIds } : {}),
+			...(sourcesIds ? { sources: sourcesIds } : {}),
+			...(decisionsIds ? { decisions: decisionsIds } : {}),
+			...(openQuestionsIds ? { openQuestions: openQuestionsIds } : {}),
+		},
 	};
 }
 
