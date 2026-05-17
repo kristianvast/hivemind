@@ -28,15 +28,18 @@ let pusherWarningLogged = false;
 // Managed-database handle required by the Workers sync API. The rescue
 // sync writes nothing to it — the orchestrator's real state lives in the
 // 🔒 Hivemind internal state toggle on each brief page. We declare a
-// single-property schema so the SDK is satisfied and the migration is
-// effectively a no-op on every deploy.
+// minimal two-property schema (matching the sync-example.ts shape) so the
+// SDK is satisfied and the migration is effectively a no-op on every deploy.
+// primaryKeyProperty MUST point at a non-title property; the title property
+// is informational only.
 const hivemindSystemDb = worker.database("hivemindSystem", {
 	type: "managed",
 	initialTitle: "Hivemind System",
-	primaryKeyProperty: "Name",
+	primaryKeyProperty: "Key",
 	schema: {
 		properties: {
 			Name: Schema.title(),
+			Key: Schema.richText(),
 		},
 	},
 });
